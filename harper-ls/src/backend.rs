@@ -504,12 +504,25 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        // Get dictionary completions using prefix search
-        let completions = doc_state.dict.find_words_with_prefix(&prefix);
+        // Get dictionary completions using manual prefix search
+        // (older versions of harper-core don't have find_words_with_prefix)
+        let prefix_lower: Vec<char> = prefix.iter().map(|c| c.to_lowercase().next().unwrap()).collect();
 
-        // Convert to LSP completion items
-        let completion_items: Vec<CompletionItem> = completions
-            .into_iter()
+        let completion_items: Vec<CompletionItem> = doc_state
+            .dict
+            .as_ref()
+            .words_iter()
+            .filter(|word| {
+                // Check if word starts with prefix (case-insensitive)
+                if word.len() < prefix.len() {
+                    return false;
+                }
+                let word_prefix: Vec<char> = word[..prefix.len()]
+                    .iter()
+                    .map(|c| c.to_lowercase().next().unwrap())
+                    .collect();
+                word_prefix == prefix_lower
+            })
             .take(completion_config.max_results)
             .map(|word| {
                 let word_string: String = word.iter().collect();
