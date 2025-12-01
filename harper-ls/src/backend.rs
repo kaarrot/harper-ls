@@ -10,6 +10,7 @@ use crate::document_state::DocumentState;
 use crate::git_commit_parser::GitCommitParser;
 use crate::ignored_lints_io::{load_ignored_lints, save_ignored_lints};
 use crate::io_utils::fileify_path;
+use crate::pos_conv;
 use anyhow::{Context, Result, anyhow};
 use futures::future::join;
 use harper_comments::CommentParser;
@@ -32,6 +33,7 @@ use tower_lsp_server::jsonrpc::Result as JsonResult;
 use tower_lsp_server::lsp_types::notification::PublishDiagnostics;
 use tower_lsp_server::lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     ConfigurationItem, Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, ExecuteCommandOptions,
@@ -464,6 +466,69 @@ impl Backend {
             .await;
     }
 
+    /// Generate completion suggestions based on the current cursor position
+    async fn generate_completions(
+        &self,
+        uri: &Uri,
+        position: tower_lsp_server::lsp_types::Position,
+    ) -> JsonResult<Vec<CompletionItem>> {
+        // Check if completion is enabled
+        let completion_config = {
+            let config = self.config.read().await;
+            config.completion_config.clone()
+        };
+
+        if !completion_config.enabled {
+            return Ok(Vec::new());
+        }
+
+        let doc_states = self.doc_state.lock().await;
+        let Some(doc_state) = doc_states.get(uri) else {
+            return Ok(Vec::new());
+        };
+
+        let source: Vec<char> = doc_state.document.get_source().iter().copied().collect();
+
+        // Convert LSP position to character index
+        let cursor_index = pos_conv::position_to_index(&source, position);
+
+        // Find the word being typed by looking backwards from cursor
+        let word_start = source[..cursor_index]
+            .iter()
+            .rposition(|c| !c.is_alphanumeric() && *c != '\'' && *c != '-')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // Extract the prefix being typed
+        let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
+
+        // Don't show completions for very short prefixes
+        if prefix.len() < completion_config.min_prefix_length {
+            return Ok(Vec::new());
+        }
+
+        // Get dictionary completions using prefix search
+        let completions = doc_state.dict.find_words_with_prefix(&prefix);
+
+        // Convert to LSP completion items
+        let completion_items: Vec<CompletionItem> = completions
+            .into_iter()
+            .take(completion_config.max_results)
+            .map(|word| {
+                let word_string: String = word.iter().collect();
+                CompletionItem {
+                    label: word_string.clone(),
+                    kind: Some(CompletionItemKind::TEXT),
+                    detail: Some("Dictionary".to_string()),
+                    insert_text: Some(word_string.clone()),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        Ok(completion_items)
+    }
+
     /// Update the configuration of the server and publish document updates that
     /// match it.
     async fn update_config_from_obj(&self, json_obj: Value) {
@@ -522,6 +587,13 @@ impl LanguageServer for Backend {
             }),
             capabilities: ServerCapabilities {
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: None,
+                    all_commit_characters: None,
+                    work_done_progress_options: Default::default(),
+                    completion_item: None,
+                }),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         "HarperRecordLint".to_owned(),
@@ -837,6 +909,24 @@ impl LanguageServer for Backend {
             .await?;
 
         Ok(Some(actions))
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> JsonResult<Option<CompletionResponse>> {
+        let completions = self
+            .generate_completions(
+                &params.text_document_position.text_document.uri,
+                params.text_document_position.position,
+            )
+            .await?;
+
+        if completions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(completions)))
+        }
     }
 
     async fn shutdown(&self) -> JsonResult<()> {

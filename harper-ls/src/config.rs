@@ -62,6 +62,64 @@ impl CodeActionConfig {
     }
 }
 
+/// Configuration for completion behavior
+#[derive(Debug, Clone)]
+pub struct CompletionConfig {
+    /// Whether completion is enabled
+    pub enabled: bool,
+    /// Minimum prefix length before showing completions
+    pub min_prefix_length: usize,
+    /// Maximum number of completion results to return
+    pub max_results: usize,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_prefix_length: 2,
+            max_results: 50,
+        }
+    }
+}
+
+impl CompletionConfig {
+    pub fn from_lsp_config(value: Value) -> Result<Self> {
+        let mut base = CompletionConfig::default();
+
+        let Value::Object(value) = value else {
+            bail!("The completion configuration must be an object.");
+        };
+
+        if let Some(enabled_val) = value.get("enabled") {
+            let Value::Bool(enabled) = enabled_val else {
+                bail!("enabled must be a boolean value.");
+            };
+            base.enabled = *enabled;
+        }
+
+        if let Some(min_prefix_val) = value.get("minPrefixLength") {
+            let Value::Number(min_prefix) = min_prefix_val else {
+                bail!("minPrefixLength must be a number.");
+            };
+            if let Some(val) = min_prefix.as_u64() {
+                base.min_prefix_length = val as usize;
+            }
+        }
+
+        if let Some(max_results_val) = value.get("maxResults") {
+            let Value::Number(max_results) = max_results_val else {
+                bail!("maxResults must be a number.");
+            };
+            if let Some(val) = max_results.as_u64() {
+                base.max_results = val as usize;
+            }
+        }
+
+        Ok(base)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub user_dict_path: PathBuf,
@@ -72,6 +130,7 @@ pub struct Config {
     pub lint_config: LintGroupConfig,
     pub diagnostic_severity: DiagnosticSeverity,
     pub code_action_config: CodeActionConfig,
+    pub completion_config: CompletionConfig,
     pub isolate_english: bool,
     pub markdown_options: MarkdownOptions,
     pub dialect: Dialect,
@@ -169,6 +228,10 @@ impl Config {
             base.code_action_config = CodeActionConfig::from_lsp_config(v.clone())?;
         }
 
+        if let Some(v) = value.get("completion") {
+            base.completion_config = CompletionConfig::from_lsp_config(v.clone())?;
+        }
+
         if let Some(v) = value.get("isolateEnglish") {
             if let Value::Bool(v) = v {
                 base.isolate_english = *v;
@@ -221,6 +284,7 @@ impl Default for Config {
             lint_config: LintGroupConfig::default(),
             diagnostic_severity: DiagnosticSeverity::Hint,
             code_action_config: CodeActionConfig::default(),
+            completion_config: CompletionConfig::default(),
             isolate_english: false,
             markdown_options: MarkdownOptions::default(),
             dialect: Dialect::American,
