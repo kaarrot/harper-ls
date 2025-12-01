@@ -39,7 +39,7 @@ fn index_to_position(source: &[char], index: usize) -> Position {
 /// The position is converted to an index using saturating arithmetic. If the requested line index
 /// is too high, the index of the last character in the source is returned. If the line is
 /// in-bounds but the requested character isn't, the last character of that line is returned.
-fn position_to_index(source: &[char], position: Position) -> usize {
+pub fn position_to_index(source: &[char], position: Position) -> usize {
     // Find target line.
     let Some(target_line) = source
         // Split including the newline character so we don't lose any characters.
