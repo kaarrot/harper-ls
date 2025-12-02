@@ -508,7 +508,8 @@ impl Backend {
         // (older versions of harper-core don't have find_words_with_prefix)
         let prefix_lower: Vec<char> = prefix.iter().map(|c| c.to_lowercase().next().unwrap()).collect();
 
-        let completion_items: Vec<CompletionItem> = doc_state
+        // Manually filter words by prefix
+        let completions: Vec<&[char]> = doc_state
             .dict
             .as_ref()
             .words_iter()
@@ -523,8 +524,36 @@ impl Backend {
                     .collect();
                 word_prefix == prefix_lower
             })
-            .take(completion_config.max_results)
+            .collect();
+
+        // Cache metadata to avoid repeated lookups during sorting
+        let mut completions_with_metadata: Vec<_> = completions
+            .into_iter()
             .map(|word| {
+                let is_common = doc_state
+                    .dict
+                    .get_lexeme_metadata(word)
+                    .as_ref()
+                    .map(|m| m.common)
+                    .unwrap_or(false);
+                (word, is_common)
+            })
+            .collect();
+
+        // Sort by common words first (using cached metadata), then alphabetically
+        completions_with_metadata.sort_by(|(word_a, common_a), (word_b, common_b)| {
+            // Common words come first (reverse order for bools)
+            match common_b.cmp(common_a) {
+                std::cmp::Ordering::Equal => word_a.cmp(word_b),
+                other => other,
+            }
+        });
+
+        // Convert to LSP completion items
+        let completion_items: Vec<CompletionItem> = completions_with_metadata
+            .into_iter()
+            .take(completion_config.max_results)
+            .map(|(word, _)| {
                 let word_string: String = word.iter().collect();
                 CompletionItem {
                     label: word_string.clone(),
