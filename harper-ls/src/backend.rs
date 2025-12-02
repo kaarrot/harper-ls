@@ -510,11 +510,34 @@ impl Backend {
         // Get dictionary completions using prefix search
         let completions = doc_state.dict.find_words_with_prefix(&prefix);
 
+        // Cache metadata to avoid repeated lookups during sorting
+        let mut completions_with_metadata: Vec<_> = completions
+            .into_iter()
+            .map(|word| {
+                let is_common = doc_state
+                    .dict
+                    .get_word_metadata(word.as_ref())
+                    .as_ref()
+                    .map(|m| m.common)
+                    .unwrap_or(false);
+                (word, is_common)
+            })
+            .collect();
+
+        // Sort by common words first (using cached metadata), then alphabetically
+        completions_with_metadata.sort_by(|(word_a, common_a), (word_b, common_b)| {
+            // Common words come first (reverse order for bools)
+            match common_b.cmp(common_a) {
+                std::cmp::Ordering::Equal => word_a.as_ref().cmp(word_b.as_ref()),
+                other => other,
+            }
+        });
+
         // Convert to LSP completion items
-        let completion_items: Vec<CompletionItem> = completions
+        let completion_items: Vec<CompletionItem> = completions_with_metadata
             .into_iter()
             .take(completion_config.max_results)
-            .map(|word| {
+            .map(|(word, _)| {
                 let word_string: String = word.iter().collect();
                 CompletionItem {
                     label: word_string.clone(),
