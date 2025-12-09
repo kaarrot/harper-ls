@@ -18,7 +18,9 @@ use harper_core::linting::{LintGroup, LintGroupConfig};
 use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
 };
-use harper_core::spell::{Dictionary, FstDictionary, MergedDictionary, MutableDictionary};
+use harper_core::spell::{
+    Dictionary, FstDictionary, MergedDictionary, MutableDictionary,
+};
 use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
@@ -56,6 +58,52 @@ pub struct Backend {
     config: RwLock<Config>,
     stats: RwLock<Stats>,
     doc_state: Mutex<HashMap<Uri, DocumentState>>,
+}
+
+fn generate_completion_list(
+    doc_state: &DocumentState,
+    prefix: &[char],
+) -> Vec<(String, f32)> {
+    // Get dictionary completions using prefix search
+    let prefix_completions = doc_state.dict.find_words_with_prefix(prefix);
+
+    // Get fuzzy completions for typo tolerance
+    let fuzzy_completions = doc_state.dict.fuzzy_match(prefix, 1, 5);
+
+    // Combine and rank completions
+    let mut combined_completions: Vec<(String, f32)> = Vec::new();
+    let mut seen_words = std::collections::HashSet::new();
+
+    // Add prefix completions with a high score
+    for word in prefix_completions {
+        let word_string: String = word.iter().collect();
+        if seen_words.insert(word_string.clone()) {
+            let is_common = doc_state
+                .dict
+                .get_word_metadata(word.as_ref())
+                .as_ref()
+                .map(|m| m.common)
+                .unwrap_or(false);
+            let score = if is_common { 2.0 } else { 1.0 };
+            combined_completions.push((word_string, score));
+        }
+    }
+
+    // Add fuzzy completions with a score based on edit distance
+    for fuzzy_match in fuzzy_completions {
+        let word_string: String = fuzzy_match.word.iter().collect();
+        if seen_words.insert(word_string.clone()) {
+            let is_common = fuzzy_match.metadata.common;
+            let score = (1.0 - (fuzzy_match.edit_distance as f32 / 2.0))
+                + if is_common { 0.5 } else { 0.0 };
+            combined_completions.push((word_string, score));
+        }
+    }
+
+    // Sort by score in descending order
+    combined_completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    combined_completions
 }
 
 impl Backend {
@@ -145,7 +193,7 @@ impl Backend {
         .context("Unable to save the dictionary to path.")
     }
 
-    async fn load_user_dictionary(&self) -> MutableDictionary {
+    async fn load_user_dictionary(&self, ) -> MutableDictionary {
         let config = self.config.read().await;
 
         load_dict(&config.user_dict_path, self.config.read().await.dialect)
@@ -273,7 +321,7 @@ impl Backend {
             )
         {
             doc_lock.remove(uri);
-            return Ok(());
+            return Ok(())
         }
 
         let ignored_lints = self.load_ignored_lints(uri).await.unwrap_or_default();
@@ -307,7 +355,7 @@ impl Backend {
 
         let Some(language_id) = &doc_state.language_id else {
             doc_lock.remove(uri);
-            return Ok(());
+            return Ok(())
         };
 
         async fn use_ident_dict<'a>(
@@ -507,38 +555,13 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        // Get dictionary completions using prefix search
-        let completions = doc_state.dict.find_words_with_prefix(&prefix);
-
-        // Cache metadata to avoid repeated lookups during sorting
-        let mut completions_with_metadata: Vec<_> = completions
-            .into_iter()
-            .map(|word| {
-                let is_common = doc_state
-                    .dict
-                    .get_word_metadata(word.as_ref())
-                    .as_ref()
-                    .map(|m| m.common)
-                    .unwrap_or(false);
-                (word, is_common)
-            })
-            .collect();
-
-        // Sort by common words first (using cached metadata), then alphabetically
-        completions_with_metadata.sort_by(|(word_a, common_a), (word_b, common_b)| {
-            // Common words come first (reverse order for bools)
-            match common_b.cmp(common_a) {
-                std::cmp::Ordering::Equal => word_a.as_ref().cmp(word_b.as_ref()),
-                other => other,
-            }
-        });
+        let combined_completions = generate_completion_list(doc_state, &prefix);
 
         // Convert to LSP completion items
-        let completion_items: Vec<CompletionItem> = completions_with_metadata
+        let completion_items: Vec<CompletionItem> = combined_completions
             .into_iter()
             .take(completion_config.max_results)
-            .map(|(word, _)| {
-                let word_string: String = word.iter().collect();
+            .map(|(word_string, _)| {
                 CompletionItem {
                     label: word_string.clone(),
                     kind: Some(CompletionItemKind::TEXT),
@@ -844,7 +867,7 @@ impl LanguageServer for Backend {
             }
             "HarperOpen" => match open::that(&first) {
                 Ok(()) => {
-                    let message = format!(r#"Opened "{first}""#);
+                    let message = format!(r#"Opened \"{{first}}\""#);
 
                     self.client.log_message(MessageType::INFO, &message).await;
 
@@ -975,3 +998,4 @@ impl LanguageServer for Backend {
         Ok(())
     }
 }
+
