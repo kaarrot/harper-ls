@@ -64,46 +64,107 @@ fn generate_completion_list(
     doc_state: &DocumentState,
     prefix: &[char],
 ) -> Vec<(String, f32)> {
-    // Get dictionary completions using prefix search
-    let prefix_completions = doc_state.dict.find_words_with_prefix(prefix);
+    // Use fuzzy matching for all completions (includes exact prefix matches with distance=0)
+    // Use max distance of 2 for good typo tolerance, fetch 200 results
+    let fuzzy_completions = doc_state.dict.fuzzy_match(prefix, 2, 200);
 
-    // Get fuzzy completions for typo tolerance
-    let fuzzy_completions = doc_state.dict.fuzzy_match(prefix, 1, 5);
-
-    // Combine and rank completions
-    let mut combined_completions: Vec<(String, f32)> = Vec::new();
-    let mut seen_words = std::collections::HashSet::new();
-
-    // Add prefix completions with a high score
-    for word in prefix_completions {
-        let word_string: String = word.iter().collect();
-        if seen_words.insert(word_string.clone()) {
-            let is_common = doc_state
-                .dict
-                .get_word_metadata(word.as_ref())
-                .as_ref()
-                .map(|m| m.common)
-                .unwrap_or(false);
-            let score = if is_common { 2.0 } else { 1.0 };
-            combined_completions.push((word_string, score));
+    // Helper function to check if word is a simple transposition of prefix
+    let is_transposition = |word: &[char]| -> bool {
+        if word.len() != prefix.len() {
+            return false;
         }
-    }
+        let mut diff_positions = Vec::new();
+        for (i, (p, w)) in prefix.iter().zip(word.iter()).enumerate() {
+            if !p.eq_ignore_ascii_case(w) {
+                diff_positions.push(i);
+                if diff_positions.len() > 2 {
+                    return false;
+                }
+            }
+        }
+        // Check if exactly 2 positions differ and they are adjacent and swapped
+        if diff_positions.len() == 2 {
+            let i = diff_positions[0];
+            let j = diff_positions[1];
+            if j == i + 1 {
+                return prefix[i].eq_ignore_ascii_case(&word[j])
+                    && prefix[j].eq_ignore_ascii_case(&word[i]);
+            }
+        }
+        false
+    };
 
-    // Add fuzzy completions with a score based on edit distance
-    for fuzzy_match in fuzzy_completions {
-        let word_string: String = fuzzy_match.word.iter().collect();
-        if seen_words.insert(word_string.clone()) {
+    // Score all fuzzy completions
+    let mut completions: Vec<(String, f32)> = fuzzy_completions
+        .into_iter()
+        .map(|fuzzy_match| {
+            let word_string: String = fuzzy_match.word.iter().collect();
             let is_common = fuzzy_match.metadata.common;
-            let score = (1.0 - (fuzzy_match.edit_distance as f32 / 2.0))
-                + if is_common { 0.5 } else { 0.0 };
-            combined_completions.push((word_string, score));
-        }
-    }
+            let is_trans = is_transposition(fuzzy_match.word);
+
+            let score = calculate_completion_score(
+                prefix,
+                fuzzy_match.word,
+                fuzzy_match.edit_distance,
+                is_common,
+                is_trans,
+            );
+            (word_string, score)
+        })
+        .collect();
 
     // Sort by score in descending order
-    combined_completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    combined_completions
+    completions
+}
+
+/// Calculate a completion score for ranking suggestions.
+/// Higher scores are better.
+fn calculate_completion_score(
+    query: &[char],
+    candidate: &[char],
+    edit_distance: u8,
+    is_common: bool,
+    is_transposition: bool,
+) -> f32 {
+    let mut score = 100.0;
+
+    // Strong penalty for edit distance - this is the primary signal
+    // Lower distance = more likely what user intended
+    score -= (edit_distance as f32) * 30.0;
+
+    // Length similarity - prefer words closer to query length
+    let len_diff = (candidate.len() as i32 - query.len() as i32).abs();
+    score -= (len_diff as f32) * 5.0;
+
+    // First letter match bonus - very strong signal of intent
+    // Users rarely mistype the first letter
+    if !query.is_empty() && !candidate.is_empty() {
+        if query[0].eq_ignore_ascii_case(&candidate[0]) {
+            score += 50.0;
+        }
+    }
+
+    // Transposition bonus (adjacent letter swaps are very common typos)
+    if is_transposition {
+        score += 25.0;
+    }
+
+    // Common word bonus - scaled by word length
+    // Short common words (to, the, of) get big bonus
+    // Longer common words get smaller bonus so they don't dominate proper nouns
+    if is_common {
+        if candidate.len() <= 3 {
+            score += 80.0;  // Major bonus for very short common words
+        } else if candidate.len() <= 5 {
+            score += 40.0;  // Moderate bonus for short common words
+        } else {
+            score += 20.0;  // Small bonus for longer common words
+        }
+    }
+
+    score
 }
 
 impl Backend {
@@ -550,23 +611,36 @@ impl Backend {
         // Extract the prefix being typed
         let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
 
+        // Log what we're completing
+        use tracing::info;
+        let prefix_str: String = prefix.iter().collect();
+        info!("Completion request: prefix='{}', len={}", prefix_str, prefix.len());
+
         // Don't show completions for very short prefixes
         if prefix.len() < completion_config.min_prefix_length {
+            info!("Prefix too short, skipping");
             return Ok(Vec::new());
         }
 
         let combined_completions = generate_completion_list(doc_state, &prefix);
+        info!("Returning {} completions for '{}'", combined_completions.len(), prefix_str);
+        let prefix_string: String = prefix.iter().collect();
 
         // Convert to LSP completion items
+        // Set filter_text to the prefix so client-side filtering matches our fuzzy results
+        // Set sort_text to preserve our score-based ordering (already sorted by score desc)
         let completion_items: Vec<CompletionItem> = combined_completions
             .into_iter()
             .take(completion_config.max_results)
-            .map(|(word_string, _)| {
+            .enumerate()
+            .map(|(idx, (word_string, _))| {
                 CompletionItem {
                     label: word_string.clone(),
                     kind: Some(CompletionItemKind::TEXT),
                     detail: Some("Dictionary".to_string()),
                     insert_text: Some(word_string.clone()),
+                    filter_text: Some(prefix_string.clone()),
+                    sort_text: Some(format!("{:05}", idx)),
                     ..Default::default()
                 }
             })
@@ -635,7 +709,13 @@ impl LanguageServer for Backend {
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
-                    trigger_characters: None,
+                    // Trigger on all letters so completions appear as user types
+                    trigger_characters: Some(
+                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                            .chars()
+                            .map(String::from)
+                            .collect(),
+                    ),
                     all_commit_characters: None,
                     work_done_progress_options: Default::default(),
                     completion_item: None,
