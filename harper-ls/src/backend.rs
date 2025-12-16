@@ -10,7 +10,6 @@ use crate::document_state::DocumentState;
 use crate::git_commit_parser::GitCommitParser;
 use crate::ignored_lints_io::{load_ignored_lints, save_ignored_lints};
 use crate::io_utils::fileify_path;
-use crate::pos_conv;
 use anyhow::{Context, Result, anyhow};
 use futures::future::join;
 use harper_comments::CommentParser;
@@ -31,6 +30,7 @@ use harper_stats::{Record, Stats};
 use harper_typst::Typst;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, Instant, sleep};
 use tower_lsp_server::jsonrpc::Result as JsonResult;
 use tower_lsp_server::lsp_types::notification::PublishDiagnostics;
 use tower_lsp_server::lsp_types::{
@@ -58,6 +58,7 @@ pub struct Backend {
     config: RwLock<Config>,
     stats: RwLock<Stats>,
     doc_state: Mutex<HashMap<Uri, DocumentState>>,
+    pending_changes: RwLock<HashMap<Uri, Instant>>,
 }
 
 fn generate_completion_list(
@@ -316,6 +317,7 @@ impl Backend {
             stats: RwLock::new(Stats::new()),
             config: RwLock::new(config),
             doc_state: Mutex::new(HashMap::new()),
+            pending_changes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -668,6 +670,10 @@ impl Backend {
                     // with the document when it is edited.
                     doc_state.document = Document::default();
                 }
+
+                // Build line index for O(1) position conversions
+                let source: Vec<char> = doc_state.document.get_source().iter().copied().collect();
+                doc_state.line_index = crate::pos_conv::LineIndex::new(&source);
             }
         }
 
@@ -732,15 +738,22 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        let doc_states = self.doc_state.lock().await;
-        let Some(doc_state) = doc_states.get(uri) else {
-            return Ok(Vec::new());
-        };
+        // Copy needed data while holding lock, then release it before expensive operations
+        // This follows the pattern from commits 6760b477 and e4251ac2
+        let (source, dict, line_index) = {
+            let doc_states = self.doc_state.lock().await;
+            let Some(doc_state) = doc_states.get(uri) else {
+                return Ok(Vec::new());
+            };
+            (
+                doc_state.document.get_source().iter().copied().collect::<Vec<char>>(),
+                doc_state.dict.clone(),
+                doc_state.line_index.clone(),
+            )
+        }; // Lock released here
 
-        let source: Vec<char> = doc_state.document.get_source().iter().copied().collect();
-
-        // Convert LSP position to character index
-        let cursor_index = pos_conv::position_to_index(&source, position);
+        // Convert LSP position to character index using line index (O(1) instead of O(N))
+        let cursor_index = line_index.position_to_index(&source, position);
 
         // Find the word being typed by looking backwards from cursor
         let word_start = source[..cursor_index]
@@ -763,14 +776,62 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        let combined_completions = generate_completion_list(doc_state, &prefix);
-        info!("Returning {} completions for '{}'", combined_completions.len(), prefix_str);
+        // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
+        // This is the same logic as generate_completion_list but without needing DocumentState
+        let fuzzy_completions = dict.fuzzy_match(&prefix, 2, 200);
+
+        // Helper function to check if word is a simple transposition of prefix
+        let is_transposition = |word: &[char]| -> bool {
+            if word.len() != prefix.len() {
+                return false;
+            }
+            let mut diff_positions = Vec::new();
+            for (i, (p, w)) in prefix.iter().zip(word.iter()).enumerate() {
+                if !p.eq_ignore_ascii_case(w) {
+                    diff_positions.push(i);
+                    if diff_positions.len() > 2 {
+                        return false;
+                    }
+                }
+            }
+            if diff_positions.len() == 2 {
+                let i = diff_positions[0];
+                let j = diff_positions[1];
+                if j == i + 1 {
+                    return prefix[i].eq_ignore_ascii_case(&word[j])
+                        && prefix[j].eq_ignore_ascii_case(&word[i]);
+                }
+            }
+            false
+        };
+
+        let mut completions: Vec<(String, f32)> = fuzzy_completions
+            .into_iter()
+            .map(|fuzzy_match| {
+                let word_string: String = fuzzy_match.word.iter().collect();
+                let is_common = fuzzy_match.metadata.common;
+                let is_trans = is_transposition(fuzzy_match.word);
+
+                let score = calculate_completion_score(
+                    &prefix,
+                    fuzzy_match.word,
+                    fuzzy_match.edit_distance,
+                    is_common,
+                    is_trans,
+                );
+                (word_string, score)
+            })
+            .collect();
+
+        completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        info!("Returning {} completions for '{}'", completions.len(), prefix_str);
         let prefix_string: String = prefix.iter().collect();
 
         // Convert to LSP completion items
         // Set filter_text to the prefix so client-side filtering matches our fuzzy results
         // Set sort_text to preserve our score-based ordering (already sorted by score desc)
-        let completion_items: Vec<CompletionItem> = combined_completions
+        let completion_items: Vec<CompletionItem> = completions
             .into_iter()
             .take(completion_config.max_results)
             .enumerate()
@@ -933,14 +994,43 @@ impl LanguageServer for Backend {
             return;
         };
 
-        if let Err(err) = self
-            .update_document(&params.text_document.uri, &last.text, None)
-            .await
+        let uri = params.text_document.uri.clone();
+        let text = last.text.clone();
+
+        // Record this change with current timestamp
+        let now = Instant::now();
         {
+            let mut pending = self.pending_changes.write().await;
+            pending.insert(uri.clone(), now);
+        }
+
+        // Debounce: wait 300ms before processing
+        sleep(Duration::from_millis(300)).await;
+
+        // Check if this is still the latest change for this URI
+        let should_process = {
+            let pending = self.pending_changes.read().await;
+            pending.get(&uri).map_or(false, |&timestamp| timestamp == now)
+        };
+
+        if !should_process {
+            // A newer change came in, skip this one
+            return;
+        }
+
+        // Process the document update
+        if let Err(err) = self.update_document(&uri, &text, None).await {
             error!("{err}")
         }
 
-        self.publish_diagnostics(&params.text_document.uri).await;
+        // Publish diagnostics
+        self.publish_diagnostics(&uri).await;
+
+        // Clear from pending
+        {
+            let mut pending = self.pending_changes.write().await;
+            pending.remove(&uri);
+        }
     }
 
     async fn did_close(&self, _params: DidCloseTextDocumentParams) {
