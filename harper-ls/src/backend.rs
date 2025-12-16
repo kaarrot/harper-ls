@@ -121,6 +121,18 @@ fn generate_completion_list(
 
 /// Calculate a completion score for ranking suggestions.
 /// Higher scores are better.
+/// Uses multiple signals to determine relevance:
+/// - Edit distance (primary signal - exact matches win)
+/// - First letter match (strong signal - users rarely mistype first letter)
+/// - Prefix match length (longer common prefixes = better matches)
+/// - Character overlap at same positions (more matching chars = better)
+/// - Position of first difference (later errors more forgivable)
+/// - Substring containment (query contained in candidate)
+/// - Transposition detection (adjacent character swaps are common typos)
+/// - Common word bonus (scaled by length to avoid overwhelming proper nouns)
+/// - Length similarity (prefer words closer to query length)
+/// - Character frequency similarity (similar character distributions)
+/// - Last character match (small bonus for matching endings)
 fn calculate_completion_score(
     query: &[char],
     candidate: &[char],
@@ -130,25 +142,92 @@ fn calculate_completion_score(
 ) -> f32 {
     let mut score = 100.0;
 
-    // Strong penalty for edit distance - this is the primary signal
-    // Lower distance = more likely what user intended
-    score -= (edit_distance as f32) * 30.0;
+    // === PRIMARY SIGNALS ===
 
-    // Length similarity - prefer words closer to query length
-    let len_diff = (candidate.len() as i32 - query.len() as i32).abs();
-    score -= (len_diff as f32) * 5.0;
+    // Progressive edit distance penalty - create bigger gaps between distance levels
+    // Exact matches (distance=0) should dominate, followed by single typos (distance=1)
+    score -= match edit_distance {
+        0 => 0.0,
+        1 => 20.0,
+        2 => 50.0,
+        _ => 100.0,
+    };
 
-    // First letter match bonus - very strong signal of intent
+    // First letter match - very strong signal of intent
     // Users rarely mistype the first letter
     if !query.is_empty() && !candidate.is_empty() {
         if query[0].eq_ignore_ascii_case(&candidate[0]) {
             score += 50.0;
+        } else {
+            // First letter mismatch is a very bad sign for completions
+            score -= 30.0;
         }
     }
 
+    // === SECONDARY SIGNALS (break ties for same edit distance) ===
+
+    // Prefix match length - longer matching prefixes indicate better completions
+    // This is a critical tie-breaker for same edit distance
+    let prefix_match_len = query
+        .iter()
+        .zip(candidate.iter())
+        .take_while(|(q, c)| q.eq_ignore_ascii_case(c))
+        .count();
+    score += (prefix_match_len as f32) * 8.0;
+
+    // Character overlap at same positions
+    // Count how many characters match at their exact positions
+    let char_overlap = query
+        .iter()
+        .zip(candidate.iter())
+        .filter(|(q, c)| q.eq_ignore_ascii_case(c))
+        .count();
+    score += (char_overlap as f32) * 3.0;
+
+    // Position of first difference - errors at the end are more forgivable
+    // Users may still be typing, so later errors are more acceptable
+    if edit_distance > 0 {
+        let first_diff_pos = query
+            .iter()
+            .zip(candidate.iter())
+            .position(|(q, c)| !q.eq_ignore_ascii_case(c))
+            .unwrap_or_else(|| query.len().min(candidate.len()));
+
+        let position_ratio = first_diff_pos as f32 / query.len().max(1) as f32;
+        // Exponential bonus: 0.0 -> 0 points, 0.5 -> 3.75, 1.0 -> 15 points
+        score += position_ratio * position_ratio * 15.0;
+    }
+
+    // Substring containment - does candidate contain query as substring?
+    // Example: "his" is contained in "this" starting at position 1
+    // Only award this bonus if edit_distance > 0 (not an exact prefix match)
+    if edit_distance > 0 && candidate.len() >= query.len() {
+        let query_lower: Vec<char> = query.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let candidate_lower: Vec<char> = candidate.iter().map(|c| c.to_ascii_lowercase()).collect();
+
+        if candidate_lower
+            .windows(query.len())
+            .any(|window| window == query_lower.as_slice())
+        {
+            score += 25.0;
+        }
+    }
+
+    // Progressive length difference penalty
+    // Small differences are acceptable, larger differences are penalized more
+    let len_diff = (candidate.len() as i32 - query.len() as i32).abs();
+    score -= match len_diff {
+        0 => 0.0,
+        1 => 2.0,
+        2 => 5.0,
+        3 => 8.0,
+        _ => (len_diff as f32) * 3.0,
+    };
+
     // Transposition bonus (adjacent letter swaps are very common typos)
+    // Example: "teh" -> "the"
     if is_transposition {
-        score += 25.0;
+        score += 30.0;
     }
 
     // Common word bonus - scaled by word length
@@ -156,15 +235,77 @@ fn calculate_completion_score(
     // Longer common words get smaller bonus so they don't dominate proper nouns
     if is_common {
         if candidate.len() <= 3 {
-            score += 80.0;  // Major bonus for very short common words
+            score += 60.0; // Reduced from 80 - still prioritized but not overwhelming
         } else if candidate.len() <= 5 {
-            score += 40.0;  // Moderate bonus for short common words
+            score += 35.0; // Reduced from 40
         } else {
-            score += 20.0;  // Small bonus for longer common words
+            score += 15.0; // Reduced from 20
+        }
+    }
+
+    // === TERTIARY SIGNALS (fine-grained tie-breakers) ===
+
+    // Character frequency similarity - do the words use similar character distributions?
+    // This helps differentiate words with same edit distance
+    // Example: "ths" vs "tab" - "ths" has more similar character distribution to "this"
+    if edit_distance >= 2 {
+        let freq_similarity = calculate_char_frequency_similarity(query, candidate);
+        score += freq_similarity * 5.0;
+    }
+
+    // Last character match - small bonus for matching endings
+    if !query.is_empty() && !candidate.is_empty() {
+        if query
+            .last()
+            .unwrap()
+            .eq_ignore_ascii_case(candidate.last().unwrap())
+        {
+            score += 3.0;
         }
     }
 
     score
+}
+
+/// Calculate similarity between two words based on character frequency distribution.
+/// Returns a value between 0.0 (completely different) and 1.0 (identical distribution).
+fn calculate_char_frequency_similarity(a: &[char], b: &[char]) -> f32 {
+    let mut freq_a = [0u8; 26];
+    let mut freq_b = [0u8; 26];
+
+    // Build frequency histogram for word a
+    for &c in a {
+        if c.is_ascii_alphabetic() {
+            let idx = (c.to_ascii_lowercase() as u8 - b'a') as usize;
+            if idx < 26 {
+                freq_a[idx] = freq_a[idx].saturating_add(1);
+            }
+        }
+    }
+
+    // Build frequency histogram for word b
+    for &c in b {
+        if c.is_ascii_alphabetic() {
+            let idx = (c.to_ascii_lowercase() as u8 - b'a') as usize;
+            if idx < 26 {
+                freq_b[idx] = freq_b[idx].saturating_add(1);
+            }
+        }
+    }
+
+    // Calculate similarity as inverse of sum of absolute differences
+    let diff_sum: u32 = freq_a
+        .iter()
+        .zip(freq_b.iter())
+        .map(|(a, b)| (*a as i32 - *b as i32).abs() as u32)
+        .sum();
+
+    // Normalize to 0-1 range
+    let max_diff = (a.len() + b.len()) as f32;
+    if max_diff == 0.0 {
+        return 0.0;
+    }
+    1.0 - (diff_sum as f32 / max_diff).min(1.0)
 }
 
 impl Backend {
@@ -1076,6 +1217,315 @@ impl LanguageServer for Backend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod completion_scoring_tests {
+    use super::*;
+
+    /// Helper to convert string to Vec<char> for testing
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn test_ths_completion_ordering() {
+        // When typing "ths", "the" and "this" should rank higher than "tab", "tag"
+        let query = chars("ths");
+
+        // "the" - edit distance 1, common word
+        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false);
+
+        // "this" - edit distance 1, common word
+        let score_this = calculate_completion_score(&query, &chars("this"), 1, true, false);
+
+        // "tab" - edit distance 2, not common
+        let score_tab = calculate_completion_score(&query, &chars("tab"), 2, false, false);
+
+        // "tag" - edit distance 2, not common
+        let score_tag = calculate_completion_score(&query, &chars("tag"), 2, false, false);
+
+        // "than" - edit distance 2, common word, better prefix match
+        let score_than = calculate_completion_score(&query, &chars("than"), 2, true, false);
+
+        // Verify ordering: the/this > than > tab/tag
+        assert!(
+            score_the > score_tab,
+            "Expected 'the' ({}) to rank higher than 'tab' ({})",
+            score_the,
+            score_tab
+        );
+        assert!(
+            score_this > score_tab,
+            "Expected 'this' ({}) to rank higher than 'tab' ({})",
+            score_this,
+            score_tab
+        );
+        assert!(
+            score_the > score_tag,
+            "Expected 'the' ({}) to rank higher than 'tag' ({})",
+            score_the,
+            score_tag
+        );
+        assert!(
+            score_this > score_tag,
+            "Expected 'this' ({}) to rank higher than 'tag' ({})",
+            score_this,
+            score_tag
+        );
+
+        // "than" has better prefix match than "tab"/"tag", so should rank higher
+        assert!(
+            score_than > score_tab,
+            "Expected 'than' ({}) with 2-char prefix to rank higher than 'tab' ({})",
+            score_than,
+            score_tab
+        );
+        assert!(
+            score_than > score_tag,
+            "Expected 'than' ({}) with 2-char prefix to rank higher than 'tag' ({})",
+            score_than,
+            score_tag
+        );
+    }
+
+    #[test]
+    fn test_transposition_bonus() {
+        // "teh" -> "the" should rank very high due to transposition
+        let query = chars("teh");
+
+        // "the" with transposition detected
+        let score_transposition = calculate_completion_score(&query, &chars("the"), 1, true, true);
+
+        // "tea" without transposition (also edit distance 1)
+        let score_no_transposition =
+            calculate_completion_score(&query, &chars("tea"), 1, true, false);
+
+        assert!(
+            score_transposition > score_no_transposition,
+            "Expected transposition 'teh'->'the' ({}) to rank higher than 'teh'->'tea' ({})",
+            score_transposition,
+            score_no_transposition
+        );
+    }
+
+    #[test]
+    fn test_prefix_match_bonus() {
+        // Longer prefix matches should score higher
+        let query = chars("hel");
+
+        // "hello" - 3 char prefix match
+        let score_hello = calculate_completion_score(&query, &chars("hello"), 2, false, false);
+
+        // "help" - 3 char prefix match
+        let score_help = calculate_completion_score(&query, &chars("help"), 1, false, false);
+
+        // "hal" - 1 char prefix match
+        let score_hal = calculate_completion_score(&query, &chars("hal"), 2, false, false);
+
+        // help should rank highest (edit distance 1)
+        // hello should rank higher than hal (same edit distance, but better prefix)
+        assert!(
+            score_help > score_hello,
+            "Expected 'help' with ED=1 ({}) to rank higher than 'hello' with ED=2 ({})",
+            score_help,
+            score_hello
+        );
+        assert!(
+            score_hello > score_hal,
+            "Expected 'hello' with 3-char prefix ({}) to rank higher than 'hal' with 1-char prefix ({})",
+            score_hello,
+            score_hal
+        );
+    }
+
+    #[test]
+    fn test_substring_match() {
+        // Query contained as substring should get bonus
+        // "his" is a substring of "this"
+        let query = chars("his");
+        let score_substring = calculate_completion_score(&query, &chars("this"), 1, true, false);
+
+        let query2 = chars("wor");
+        let score_word = calculate_completion_score(&query2, &chars("word"), 1, false, false);
+
+        // These should get substring bonus (25 points) and have positive scores
+        // Just verify they're positive scores with reasonable values
+        assert!(
+            score_substring > 100.0,
+            "Expected substring match 'his' in 'this' to have high score, got {}",
+            score_substring
+        );
+        assert!(
+            score_word > 100.0,
+            "Expected substring match 'wor' in 'word' to have high score, got {}",
+            score_word
+        );
+    }
+
+    #[test]
+    fn test_exact_match_wins() {
+        // Exact matches (edit distance 0) should always have the highest scores
+        let query = chars("test");
+
+        let score_exact = calculate_completion_score(&query, &chars("test"), 0, false, false);
+        let score_ed1 = calculate_completion_score(&query, &chars("text"), 1, false, false);
+        let score_ed2 = calculate_completion_score(&query, &chars("best"), 1, false, false);
+
+        assert!(
+            score_exact > score_ed1,
+            "Exact match ({}) should beat ED=1 ({})",
+            score_exact,
+            score_ed1
+        );
+        assert!(
+            score_exact > score_ed2,
+            "Exact match ({}) should beat ED=1 with first letter mismatch ({})",
+            score_exact,
+            score_ed2
+        );
+        assert!(
+            score_ed1 > score_ed2,
+            "ED=1 with first letter match ({}) should beat ED=1 with first letter mismatch ({})",
+            score_ed1,
+            score_ed2
+        );
+    }
+
+    #[test]
+    fn test_first_letter_mismatch_penalty() {
+        // Words with mismatched first letter should rank much lower
+        let query = chars("test");
+
+        let score_match = calculate_completion_score(&query, &chars("test"), 0, false, false);
+        let score_mismatch = calculate_completion_score(&query, &chars("best"), 1, false, false);
+
+        // First letter mismatch gives -30 penalty, so even with lower edit distance,
+        // mismatched first letter should be heavily penalized
+        assert!(
+            score_match > score_mismatch,
+            "First letter match ({}) should beat mismatch ({})",
+            score_match,
+            score_mismatch
+        );
+    }
+
+    #[test]
+    fn test_common_word_bonus_scaling() {
+        // Common words should get bonuses, but scaled by length
+        let query = chars("th");
+
+        // Short common word (len=3)
+        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false);
+
+        // Medium common word (len=5)
+        let score_there = calculate_completion_score(&query, &chars("there"), 1, true, false);
+
+        // Long common word (len=7)
+        let score_through = calculate_completion_score(&query, &chars("through"), 1, true, false);
+
+        // Non-common word
+        let score_thy = calculate_completion_score(&query, &chars("thy"), 1, false, false);
+
+        // All common words should rank higher than non-common
+        assert!(
+            score_the > score_thy,
+            "Common word 'the' ({}) should rank higher than non-common 'thy' ({})",
+            score_the,
+            score_thy
+        );
+        assert!(
+            score_there > score_thy,
+            "Common word 'there' ({}) should rank higher than non-common 'thy' ({})",
+            score_there,
+            score_thy
+        );
+        assert!(
+            score_through > score_thy,
+            "Common word 'through' ({}) should rank higher than non-common 'thy' ({})",
+            score_through,
+            score_thy
+        );
+
+        // Shorter common words get bigger bonuses
+        assert!(
+            score_the > score_through,
+            "Short common word 'the' ({}) should rank higher than long common word 'through' ({})",
+            score_the,
+            score_through
+        );
+    }
+
+    #[test]
+    fn test_character_frequency_similarity() {
+        // Test the character frequency similarity helper function
+        let word_a = chars("hello");
+        let word_b = chars("olleh"); // Anagram - should have similarity 1.0
+        let word_c = chars("world"); // Different chars - should have low similarity
+
+        let sim_anagram = calculate_char_frequency_similarity(&word_a, &word_b);
+        let sim_different = calculate_char_frequency_similarity(&word_a, &word_c);
+
+        assert!(
+            sim_anagram > 0.9,
+            "Anagrams should have very high similarity, got {}",
+            sim_anagram
+        );
+        assert!(
+            sim_different < sim_anagram,
+            "Different words ({}) should have lower similarity than anagrams ({})",
+            sim_different,
+            sim_anagram
+        );
+    }
+
+    #[test]
+    fn test_position_of_first_difference() {
+        // Errors later in the word should be more forgivable
+        let query = chars("test");
+
+        // Difference at position 0 (beginning)
+        let score_beginning = calculate_completion_score(&query, &chars("best"), 1, false, false);
+
+        // Difference at position 3 (end)
+        let score_end = calculate_completion_score(&query, &chars("text"), 1, false, false);
+
+        assert!(
+            score_end > score_beginning,
+            "Error at end ({}) should be more forgivable than at beginning ({})",
+            score_end,
+            score_beginning
+        );
+    }
+
+    #[test]
+    fn test_length_difference_penalty() {
+        // Test that length penalties exist by comparing words of different lengths
+        // with the same edit distance and other characteristics
+        let query = chars("abc");
+
+        // Test with ED=2 to avoid substring bonus complications
+        // Same length (ED=2)
+        let score_same_len = calculate_completion_score(&query, &chars("xyz"), 2, false, false);
+        // +3 length (ED=2)
+        let score_len_plus_3 = calculate_completion_score(&query, &chars("xyzdef"), 2, false, false);
+        // +6 length (ED=2)
+        let score_len_plus_6 = calculate_completion_score(&query, &chars("xyzdefghi"), 2, false, false);
+
+        // Longer words should be penalized when other factors are similar
+        assert!(
+            score_same_len > score_len_plus_3,
+            "Same length ({}) should beat +3 length ({})",
+            score_same_len,
+            score_len_plus_3
+        );
+        assert!(
+            score_len_plus_3 > score_len_plus_6,
+            "+3 length ({}) should beat +6 length ({})",
+            score_len_plus_3,
+            score_len_plus_6
+        );
     }
 }
 
