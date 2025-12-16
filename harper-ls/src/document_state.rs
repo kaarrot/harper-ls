@@ -16,6 +16,7 @@ pub struct DocumentState {
     pub ignored_lints: IgnoredLints,
     pub uri: Uri,
     pub line_index: LineIndex,
+    pub last_diagnostics: Vec<Diagnostic>,
 }
 
 impl DocumentState {
@@ -105,6 +106,7 @@ impl Default for DocumentState {
             ignored_lints: Default::default(),
             uri: "https://example.net".parse().unwrap(),
             line_index: Default::default(),
+            last_diagnostics: Vec::new(),
         }
     }
 }

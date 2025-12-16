@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::config::Config;
 use crate::dictionary_io::{load_dict, save_dict};
@@ -52,6 +53,15 @@ pub fn ls_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Cache entry for dictionaries with their modification times
+#[derive(Clone)]
+struct DictCacheEntry {
+    dict: Arc<MergedDictionary>,
+    user_dict_mtime: Option<SystemTime>,
+    workspace_dict_mtime: Option<SystemTime>,
+    file_dict_mtime: Option<SystemTime>,
+}
+
 pub struct Backend {
     client: Client,
     root: RwLock<PathBuf>,
@@ -59,6 +69,7 @@ pub struct Backend {
     stats: RwLock<Stats>,
     doc_state: Mutex<HashMap<Uri, DocumentState>>,
     pending_changes: RwLock<HashMap<Uri, Instant>>,
+    dict_cache: RwLock<HashMap<Uri, DictCacheEntry>>,
 }
 
 fn generate_completion_list(
@@ -318,6 +329,7 @@ impl Backend {
             config: RwLock::new(config),
             doc_state: Mutex::new(HashMap::new()),
             pending_changes: RwLock::new(HashMap::new()),
+            dict_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -452,6 +464,14 @@ impl Backend {
         Ok(())
     }
 
+    /// Get modification time of a file, returning None if file doesn't exist or on error
+    async fn get_file_mtime(&self, path: PathBuf) -> Option<SystemTime> {
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+    }
+
     async fn generate_global_dictionary(&self) -> Result<MergedDictionary> {
         let mut dict = MergedDictionary::new();
         dict.add_dictionary(FstDictionary::curated());
@@ -463,6 +483,40 @@ impl Backend {
     }
 
     async fn generate_file_dictionary(&self, uri: &Uri) -> Result<MergedDictionary> {
+        // Check cache first
+        let cache_entry = {
+            let cache = self.dict_cache.read().await;
+            cache.get(uri).cloned()
+        };
+
+        // Get dictionary paths from config
+        let (user_dict_path, workspace_dict_path) = {
+            let config = self.config.read().await;
+            (config.user_dict_path.clone(), config.workspace_dict_path.clone())
+        };
+        let file_dict_path = self.get_file_dict_path(uri).await.ok();
+
+        // Get current modification times
+        let current_user_mtime = self.get_file_mtime(user_dict_path).await;
+        let current_workspace_mtime = self.get_file_mtime(workspace_dict_path).await;
+        let current_file_mtime = if let Some(path) = file_dict_path {
+            self.get_file_mtime(path).await
+        } else {
+            None
+        };
+
+        // Check if cache is still valid
+        if let Some(entry) = cache_entry {
+            if entry.user_dict_mtime == current_user_mtime
+                && entry.workspace_dict_mtime == current_workspace_mtime
+                && entry.file_dict_mtime == current_file_mtime
+            {
+                // Cache hit! Return cached dictionary
+                return Ok((*entry.dict).clone());
+            }
+        }
+
+        // Cache miss or invalidated - reload dictionaries
         let (global_dictionary, file_dictionary) = tokio::join!(
             self.generate_global_dictionary(),
             self.load_file_dictionary(uri)
@@ -473,6 +527,19 @@ impl Backend {
         global_dictionary.add_dictionary(Arc::new(
             file_dictionary.context("Unable to load the file dictionary.")?,
         ));
+
+        // Update cache
+        let cache_entry = DictCacheEntry {
+            dict: Arc::new(global_dictionary.clone()),
+            user_dict_mtime: current_user_mtime,
+            workspace_dict_mtime: current_workspace_mtime,
+            file_dict_mtime: current_file_mtime,
+        };
+
+        {
+            let mut cache = self.dict_cache.write().await;
+            cache.insert(uri.clone(), cache_entry);
+        }
 
         Ok(global_dictionary)
     }
@@ -710,6 +777,30 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &Uri) {
         let diagnostics = self.generate_diagnostics(uri).await;
+
+        // Check if diagnostics have changed compared to last publish
+        let should_publish = {
+            let mut doc_states = self.doc_state.lock().await;
+            if let Some(doc_state) = doc_states.get_mut(uri) {
+                // Compare with last published diagnostics
+                if diagnostics == doc_state.last_diagnostics {
+                    // Identical diagnostics - skip publishing
+                    false
+                } else {
+                    // Different diagnostics - update cache and publish
+                    doc_state.last_diagnostics = diagnostics.clone();
+                    true
+                }
+            } else {
+                // Document not found - publish anyway
+                true
+            }
+        };
+
+        if !should_publish {
+            // Skip publishing identical diagnostics
+            return;
+        }
 
         let result = PublishDiagnosticsParams {
             uri: uri.clone(),
