@@ -162,27 +162,40 @@ impl Parser for Markdown {
         let mut tokens = Vec::new();
 
         // Build a mapping from the inner parser's byte-based indexing to Harper's char-based
-        // indexing
-        let mut byte_to_char = vec![0; source_str.len() + 1];
+        // indexing. Instead of storing every byte index, we store (byte_pos, char_index) pairs
+        // at character boundaries for more efficient memory usage.
+        let mut byte_to_char_map: Vec<(usize, usize)> = Vec::new();
         let mut char_index = 0;
         let mut byte_idx = 0;
+
         for ch in source_str.chars() {
-            let char_len = ch.len_utf8();
-            for _ in 0..char_len {
-                byte_to_char[byte_idx] = char_index;
-                byte_idx += 1;
-            }
+            byte_to_char_map.push((byte_idx, char_index));
+            byte_idx += ch.len_utf8();
             char_index += 1;
         }
-        byte_to_char[source_str.len()] = char_index;
+        byte_to_char_map.push((source_str.len(), char_index));
+
+        // Helper function to convert byte index to char index
+        let byte_to_char = |byte_pos: usize| -> usize {
+            match byte_to_char_map.binary_search_by_key(&byte_pos, |&(b, _)| b) {
+                Ok(idx) => byte_to_char_map[idx].1,
+                Err(idx) => {
+                    if idx > 0 {
+                        byte_to_char_map[idx - 1].1
+                    } else {
+                        0
+                    }
+                }
+            }
+        };
 
         let mut stack = Vec::new();
 
         // NOTE: the range spits out __byte__ indices, not char indices.
         // This is why we keep track above.
         for (event, range) in md_parser.into_offset_iter() {
-            let span_start = byte_to_char[range.start];
-            let span_end = byte_to_char[range.end];
+            let span_start = byte_to_char(range.start);
+            let span_end = byte_to_char(range.end);
 
             match event {
                 pulldown_cmark::Event::SoftBreak => {

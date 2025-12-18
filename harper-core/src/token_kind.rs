@@ -44,6 +44,7 @@ pub enum TokenKind {
     EmailAddress,
     Url,
     Hostname,
+    FilePath,
     /// A special token used for things like inline code blocks that should be
     /// ignored by all linters.
     #[default]

@@ -1,7 +1,9 @@
 mod email_address;
+mod file_path;
 mod hostname;
 mod url;
 
+use file_path::lex_file_path;
 use hostname::lex_hostname_token;
 use ordered_float::OrderedFloat;
 use url::lex_url;
@@ -32,6 +34,7 @@ pub fn lex_token(source: &[char]) -> Option<FoundToken> {
         lex_number,
         lex_url,
         lex_email_address,
+        lex_file_path,    // Before lex_hostname_token and lex_word to catch paths first
         lex_hostname_token,
         lex_word,
         lex_catch,
