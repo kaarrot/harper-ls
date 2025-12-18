@@ -64,8 +64,17 @@ impl TreeSitterMasker {
     /// Returns the BYTE spans of the comment position.
     fn extract_comments(&self, cursor: &mut TreeCursor, comments: &mut Vec<Span<u8>>) {
         Self::visit_nodes(cursor, &mut |node: &Node| {
+            // Skip error nodes and nodes with unreasonable spans
+            if node.is_error() || node.is_missing() {
+                return;
+            }
+
             if (self.node_condition)(node) {
-                comments.push(node.byte_range().into());
+                let range = node.byte_range();
+                // Sanity check: ensure the range is reasonable
+                if range.start <= range.end {
+                    comments.push(range.into());
+                }
             }
         });
     }

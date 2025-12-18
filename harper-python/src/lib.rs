@@ -10,6 +10,11 @@ pub struct PythonParser {
 
 impl PythonParser {
     fn node_condition(n: &Node) -> bool {
+        // Skip error nodes - when Tree-sitter can't parse correctly
+        if n.is_error() || n.is_missing() || n.kind() == "ERROR" {
+            return false;
+        }
+
         if n.kind().contains("comment") {
             return true;
         }
