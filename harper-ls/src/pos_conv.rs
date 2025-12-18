@@ -32,6 +32,7 @@ impl LineIndex {
 
     /// Convert a character index to an LSP Position.
     /// O(log N) complexity using binary search on line starts.
+    #[allow(dead_code)]
     pub fn index_to_position(&self, source: &[char], index: usize) -> Position {
         // Binary search to find which line contains this index
         let line = match self.line_starts.binary_search(&index) {
@@ -85,6 +86,7 @@ impl LineIndex {
     }
 
     /// Convert a Span to an LSP Range using this line index.
+    #[allow(dead_code)]
     pub fn span_to_range(&self, source: &[char], span: Span<char>) -> Range {
         let start = self.index_to_position(source, span.start);
         let end = self.index_to_position(source, span.end);
@@ -92,6 +94,7 @@ impl LineIndex {
     }
 
     /// Convert an LSP Range to a Span using this line index.
+    #[allow(dead_code)]
     pub fn range_to_span(&self, source: &[char], range: Range) -> Span<char> {
         let start = self.position_to_index(source, range.start);
         let end = self.position_to_index(source, range.end);

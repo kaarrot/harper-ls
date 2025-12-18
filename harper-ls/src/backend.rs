@@ -72,65 +72,6 @@ pub struct Backend {
     dict_cache: RwLock<HashMap<Uri, DictCacheEntry>>,
 }
 
-fn generate_completion_list(
-    doc_state: &DocumentState,
-    prefix: &[char],
-) -> Vec<(String, f32)> {
-    // Use fuzzy matching for all completions (includes exact prefix matches with distance=0)
-    // Use max distance of 2 for good typo tolerance, fetch 200 results
-    let fuzzy_completions = doc_state.dict.fuzzy_match(prefix, 2, 200);
-
-    // Helper function to check if word is a simple transposition of prefix
-    let is_transposition = |word: &[char]| -> bool {
-        if word.len() != prefix.len() {
-            return false;
-        }
-        let mut diff_positions = Vec::new();
-        for (i, (p, w)) in prefix.iter().zip(word.iter()).enumerate() {
-            if !p.eq_ignore_ascii_case(w) {
-                diff_positions.push(i);
-                if diff_positions.len() > 2 {
-                    return false;
-                }
-            }
-        }
-        // Check if exactly 2 positions differ and they are adjacent and swapped
-        if diff_positions.len() == 2 {
-            let i = diff_positions[0];
-            let j = diff_positions[1];
-            if j == i + 1 {
-                return prefix[i].eq_ignore_ascii_case(&word[j])
-                    && prefix[j].eq_ignore_ascii_case(&word[i]);
-            }
-        }
-        false
-    };
-
-    // Score all fuzzy completions
-    let mut completions: Vec<(String, f32)> = fuzzy_completions
-        .into_iter()
-        .map(|fuzzy_match| {
-            let word_string: String = fuzzy_match.word.iter().collect();
-            let is_common = fuzzy_match.metadata.common;
-            let is_trans = is_transposition(fuzzy_match.word);
-
-            let score = calculate_completion_score(
-                prefix,
-                fuzzy_match.word,
-                fuzzy_match.edit_distance,
-                is_common,
-                is_trans,
-            );
-            (word_string, score)
-        })
-        .collect();
-
-    // Sort by score in descending order
-    completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    completions
-}
-
 /// Calculate a completion score for ranking suggestions.
 /// Higher scores are better.
 /// Uses multiple signals to determine relevance:

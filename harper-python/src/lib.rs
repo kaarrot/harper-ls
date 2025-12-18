@@ -61,6 +61,32 @@ impl Parser for PythonParser {
             prev_kind = Some(&token.kind);
         }
 
+        // Detect bullet points and make them act as sentence boundaries
+        // Look for patterns like: "- text\n" or "* text\n"
+        for i in 0..tokens.len() {
+            if let TokenKind::Punctuation(punct) = tokens[i].kind {
+                if matches!(punct, harper_core::Punctuation::Hyphen | harper_core::Punctuation::Star) {
+                    // Look ahead to find the newline that ends this bullet point
+                    for j in (i + 1)..tokens.len() {
+                        if matches!(tokens[j].kind, TokenKind::Newline(_)) {
+                            // Convert the newline after the bullet point to a ParagraphBreak
+                            tokens[j].kind = TokenKind::ParagraphBreak;
+                            break;
+                        }
+                        // If we hit another bullet or paragraph break, stop looking
+                        if matches!(tokens[j].kind, TokenKind::ParagraphBreak) {
+                            break;
+                        }
+                        if let TokenKind::Punctuation(p) = tokens[j].kind {
+                            if matches!(p, harper_core::Punctuation::Hyphen | harper_core::Punctuation::Star) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tokens
     }
 }
