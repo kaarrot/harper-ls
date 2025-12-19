@@ -87,6 +87,15 @@ impl Parser for PythonParser {
             }
         }
 
+        // Make newlines act as sentence boundaries in Python
+        // This treats each line as a separate sentence, which is more natural for
+        // Python code comments and docstrings
+        for token in &mut tokens {
+            if matches!(token.kind, TokenKind::Newline(_)) {
+                token.kind = TokenKind::ParagraphBreak;
+            }
+        }
+
         tokens
     }
 }
