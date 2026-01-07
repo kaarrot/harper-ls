@@ -167,14 +167,15 @@ fn calculate_completion_score(
     }
 
     // Progressive length difference penalty
-    // Small differences are acceptable, larger differences are penalized more
+    // Prefer candidates with similar length to the query
+    // Balanced to handle both "myy"→"my" and "tthi"→"this" cases
     let len_diff = (candidate.len() as i32 - query.len() as i32).abs();
     score -= match len_diff {
         0 => 0.0,
-        1 => 2.0,
-        2 => 5.0,
-        3 => 8.0,
-        _ => (len_diff as f32) * 3.0,
+        1 => 8.0,   // Moderate penalty for 1-char difference
+        2 => 25.0,  // Stronger penalty for 2-char difference
+        3 => 40.0,  // Even stronger for 3-char difference
+        _ => (len_diff as f32) * 15.0,
     };
 
     // Transposition bonus (adjacent letter swaps are very common typos)
@@ -772,15 +773,40 @@ impl Backend {
 
         // Copy needed data while holding lock, then release it before expensive operations
         // This follows the pattern from commits 6760b477 and e4251ac2
-        let (source, dict, line_index) = {
+        // Also get lints to filter out misspelled words from completions
+        let (source, dict, line_index, misspelled_words) = {
             let doc_states = self.doc_state.lock().await;
             let Some(doc_state) = doc_states.get(uri) else {
                 return Ok(Vec::new());
             };
+
+            // Extract misspelled words from diagnostics
+            // These are words that currently have spelling errors in the document
+            use tower_lsp_server::lsp_types::NumberOrString;
+            let doc_source = doc_state.document.get_source();
+            let misspelled: std::collections::HashSet<String> = doc_state
+                .last_diagnostics
+                .iter()
+                .filter(|diag| {
+                    diag.code
+                        .as_ref()
+                        .map_or(false, |code| match code {
+                            NumberOrString::String(s) => s.contains("Spelling"),
+                            _ => false,
+                        })
+                })
+                .filter_map(|diag| {
+                    let span = crate::pos_conv::range_to_span(doc_source, diag.range);
+                    let word: String = span.get_content(doc_source).iter().collect();
+                    Some(word.to_lowercase())
+                })
+                .collect();
+
             (
-                doc_state.document.get_source().iter().copied().collect::<Vec<char>>(),
+                doc_source.iter().copied().collect::<Vec<char>>(),
                 doc_state.dict.clone(),
                 doc_state.line_index.clone(),
+                misspelled,
             )
         }; // Lock released here
 
@@ -801,10 +827,12 @@ impl Backend {
         use tracing::info;
         let prefix_str: String = prefix.iter().collect();
         info!("Completion request: prefix='{}', len={}", prefix_str, prefix.len());
+        eprintln!("  Completing prefix: '{}' (len={})", prefix_str, prefix.len());
 
         // Don't show completions for very short prefixes
         if prefix.len() < completion_config.min_prefix_length {
             info!("Prefix too short, skipping");
+            eprintln!("  Prefix too short (min={})", completion_config.min_prefix_length);
             return Ok(Vec::new());
         }
 
@@ -839,8 +867,15 @@ impl Backend {
 
         let mut completions: Vec<(String, f32)> = fuzzy_completions
             .into_iter()
-            .map(|fuzzy_match| {
+            .filter_map(|fuzzy_match| {
                 let word_string: String = fuzzy_match.word.iter().collect();
+
+                // Filter out words that are currently marked as misspelled in the document
+                // This prevents suggesting "tthis" when the user typed it earlier and it has an error
+                if misspelled_words.contains(&word_string.to_lowercase()) {
+                    return None;
+                }
+
                 let is_common = fuzzy_match.metadata.common;
                 let is_trans = is_transposition(fuzzy_match.word);
 
@@ -851,28 +886,43 @@ impl Backend {
                     is_common,
                     is_trans,
                 );
-                (word_string, score)
+                Some((word_string, score))
             })
             .collect();
 
         completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         info!("Returning {} completions for '{}'", completions.len(), prefix_str);
+
+        // Calculate the start position of the word being completed
+        let word_start_position = line_index.index_to_position(&source, word_start);
+
+        // Convert prefix to string - we'll use this as filterText
+        // This tells Helix that all our completions match the user's input
         let prefix_string: String = prefix.iter().collect();
 
         // Convert to LSP completion items
-        // Set filter_text to the prefix so client-side filtering matches our fuzzy results
-        // Set sort_text to preserve our score-based ordering (already sorted by score desc)
+        // Use text_edit to replace the entire prefix
         let completion_items: Vec<CompletionItem> = completions
             .into_iter()
             .take(completion_config.max_results)
             .enumerate()
             .map(|(idx, (word_string, _))| {
+                use tower_lsp_server::lsp_types::{Range, TextEdit, CompletionTextEdit};
+
                 CompletionItem {
                     label: word_string.clone(),
                     kind: Some(CompletionItemKind::TEXT),
                     detail: Some("Dictionary".to_string()),
-                    insert_text: Some(word_string.clone()),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: Range {
+                            start: word_start_position,
+                            end: position,
+                        },
+                        new_text: word_string.clone(),
+                    })),
+                    // Set filterText to what the user typed so Helix doesn't filter it out
+                    // For "thiis", all completions get filterText="thiis" which matches user input
                     filter_text: Some(prefix_string.clone()),
                     sort_text: Some(format!("{:05}", idx)),
                     ..Default::default()
@@ -1029,14 +1079,21 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         let text = last.text.clone();
 
-        // Record this change with current timestamp
+        // IMPORTANT: Update document content immediately (without debounce)
+        // This ensures completions have access to the latest text while typing
+        if let Err(err) = self.update_document(&uri, &text, None).await {
+            error!("{err}")
+        }
+
+        // Record this change with current timestamp for debounced diagnostics
         let now = Instant::now();
         {
             let mut pending = self.pending_changes.write().await;
             pending.insert(uri.clone(), now);
         }
 
-        // Debounce: wait 300ms before processing
+        // Debounce: wait 300ms before publishing diagnostics
+        // This prevents excessive diagnostic updates while typing
         sleep(Duration::from_millis(300)).await;
 
         // Check if this is still the latest change for this URI
@@ -1046,16 +1103,11 @@ impl LanguageServer for Backend {
         };
 
         if !should_process {
-            // A newer change came in, skip this one
+            // A newer change came in, skip publishing diagnostics
             return;
         }
 
-        // Process the document update
-        if let Err(err) = self.update_document(&uri, &text, None).await {
-            error!("{err}")
-        }
-
-        // Publish diagnostics
+        // Publish diagnostics (debounced)
         self.publish_diagnostics(&uri).await;
 
         // Clear from pending
@@ -1304,12 +1356,42 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> JsonResult<Option<CompletionResponse>> {
+        eprintln!("HARPER COMPLETION CALLED: pos={:?}, trigger={:?}",
+            params.text_document_position.position,
+            params.context.as_ref().map(|c| c.trigger_kind));
+
+        // Check if cursor position might be ahead of document content
+        // This happens when Helix sends completion before didChange
+        let needs_wait = {
+            let doc_states = self.doc_state.lock().await;
+            if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
+                let source = doc_state.document.get_source();
+                let cursor_idx = doc_state.line_index.position_to_index(source, params.text_document_position.position);
+                // If cursor is at or past document end, we might be racing with didChange
+                cursor_idx >= source.len()
+            } else {
+                false
+            }
+        };
+
+        // If we're racing with didChange, wait a bit for the update to arrive
+        if needs_wait {
+            use tokio::time::{sleep, Duration};
+            sleep(Duration::from_millis(50)).await;
+        }
+
         let completions = self
             .generate_completions(
                 &params.text_document_position.text_document.uri,
                 params.text_document_position.position,
             )
             .await?;
+
+        eprintln!("HARPER COMPLETION RESULT: {} items", completions.len());
+        if !completions.is_empty() {
+            eprintln!("  First 10 items: {:?}",
+                completions.iter().take(10).map(|c| &c.label).collect::<Vec<_>>());
+        }
 
         if completions.is_empty() {
             Ok(None)
