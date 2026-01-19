@@ -9,6 +9,7 @@ mod dict_word_metadata_orthography;
 mod document;
 mod edit_distance;
 pub mod expr;
+pub mod keyboard_distance;
 mod fat_token;
 mod ignored_lints;
 pub mod language_detection;

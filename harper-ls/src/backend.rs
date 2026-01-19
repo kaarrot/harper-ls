@@ -21,6 +21,7 @@ use harper_core::parsers::{
 use harper_core::spell::{
     Dictionary, FstDictionary, MergedDictionary, MutableDictionary,
 };
+use harper_core::keyboard_distance::avg_keyboard_distance;
 use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
@@ -92,6 +93,7 @@ fn calculate_completion_score(
     edit_distance: u8,
     is_common: bool,
     is_transposition: bool,
+    avg_kbd_distance: f32,
 ) -> f32 {
     let mut score = 100.0;
 
@@ -216,6 +218,15 @@ fn calculate_completion_score(
         {
             score += 3.0;
         }
+    }
+
+    // Keyboard distance penalty (only for edit distance > 0)
+    // Lower keyboard distance = better score (keys physically closer)
+    // Conservative weighting: 8.0 points per unit distance
+    if edit_distance > 0 {
+        // avg_kbd_distance ranges from 0.0 (same key) to ~1.0 (max normalized)
+        // Penalty ranges from 0 (same keys) to ~8 (far keys)
+        score -= avg_kbd_distance * 8.0;
     }
 
     score
@@ -890,12 +901,15 @@ impl Backend {
                 let is_common = fuzzy_match.metadata.common;
                 let is_trans = is_transposition(fuzzy_match.word);
 
+                let avg_kbd_dist = avg_keyboard_distance(&prefix, fuzzy_match.word);
+
                 let score = calculate_completion_score(
                     &prefix,
                     fuzzy_match.word,
                     fuzzy_match.edit_distance,
                     is_common,
                     is_trans,
+                    avg_kbd_dist,
                 );
                 Some((word_string, score))
             })
@@ -1450,19 +1464,19 @@ mod completion_scoring_tests {
         let query = chars("ths");
 
         // "the" - edit distance 1, common word
-        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false);
+        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false, 0.0);
 
         // "this" - edit distance 1, common word
-        let score_this = calculate_completion_score(&query, &chars("this"), 1, true, false);
+        let score_this = calculate_completion_score(&query, &chars("this"), 1, true, false, 0.0);
 
         // "tab" - edit distance 2, not common
-        let score_tab = calculate_completion_score(&query, &chars("tab"), 2, false, false);
+        let score_tab = calculate_completion_score(&query, &chars("tab"), 2, false, false, 0.0);
 
         // "tag" - edit distance 2, not common
-        let score_tag = calculate_completion_score(&query, &chars("tag"), 2, false, false);
+        let score_tag = calculate_completion_score(&query, &chars("tag"), 2, false, false, 0.0);
 
         // "than" - edit distance 2, common word, better prefix match
-        let score_than = calculate_completion_score(&query, &chars("than"), 2, true, false);
+        let score_than = calculate_completion_score(&query, &chars("than"), 2, true, false, 0.0);
 
         // Verify ordering: the/this > than > tab/tag
         assert!(
@@ -1511,11 +1525,11 @@ mod completion_scoring_tests {
         let query = chars("teh");
 
         // "the" with transposition detected
-        let score_transposition = calculate_completion_score(&query, &chars("the"), 1, true, true);
+        let score_transposition = calculate_completion_score(&query, &chars("the"), 1, true, true, 0.0);
 
         // "tea" without transposition (also edit distance 1)
         let score_no_transposition =
-            calculate_completion_score(&query, &chars("tea"), 1, true, false);
+            calculate_completion_score(&query, &chars("tea"), 1, true, false, 0.0);
 
         assert!(
             score_transposition > score_no_transposition,
@@ -1531,13 +1545,13 @@ mod completion_scoring_tests {
         let query = chars("hel");
 
         // "hello" - 3 char prefix match
-        let score_hello = calculate_completion_score(&query, &chars("hello"), 2, false, false);
+        let score_hello = calculate_completion_score(&query, &chars("hello"), 2, false, false, 0.0);
 
         // "help" - 3 char prefix match
-        let score_help = calculate_completion_score(&query, &chars("help"), 1, false, false);
+        let score_help = calculate_completion_score(&query, &chars("help"), 1, false, false, 0.0);
 
         // "hal" - 1 char prefix match
-        let score_hal = calculate_completion_score(&query, &chars("hal"), 2, false, false);
+        let score_hal = calculate_completion_score(&query, &chars("hal"), 2, false, false, 0.0);
 
         // help should rank highest (edit distance 1)
         // hello should rank higher than hal (same edit distance, but better prefix)
@@ -1560,10 +1574,10 @@ mod completion_scoring_tests {
         // Query contained as substring should get bonus
         // "his" is a substring of "this"
         let query = chars("his");
-        let score_substring = calculate_completion_score(&query, &chars("this"), 1, true, false);
+        let score_substring = calculate_completion_score(&query, &chars("this"), 1, true, false, 0.0);
 
         let query2 = chars("wor");
-        let score_word = calculate_completion_score(&query2, &chars("word"), 1, false, false);
+        let score_word = calculate_completion_score(&query2, &chars("word"), 1, false, false, 0.0);
 
         // These should get substring bonus (25 points) and have positive scores
         // Just verify they're positive scores with reasonable values
@@ -1584,9 +1598,9 @@ mod completion_scoring_tests {
         // Exact matches (edit distance 0) should always have the highest scores
         let query = chars("test");
 
-        let score_exact = calculate_completion_score(&query, &chars("test"), 0, false, false);
-        let score_ed1 = calculate_completion_score(&query, &chars("text"), 1, false, false);
-        let score_ed2 = calculate_completion_score(&query, &chars("best"), 1, false, false);
+        let score_exact = calculate_completion_score(&query, &chars("test"), 0, false, false, 0.0);
+        let score_ed1 = calculate_completion_score(&query, &chars("text"), 1, false, false, 0.0);
+        let score_ed2 = calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
 
         assert!(
             score_exact > score_ed1,
@@ -1613,8 +1627,8 @@ mod completion_scoring_tests {
         // Words with mismatched first letter should rank much lower
         let query = chars("test");
 
-        let score_match = calculate_completion_score(&query, &chars("test"), 0, false, false);
-        let score_mismatch = calculate_completion_score(&query, &chars("best"), 1, false, false);
+        let score_match = calculate_completion_score(&query, &chars("test"), 0, false, false, 0.0);
+        let score_mismatch = calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
 
         // First letter mismatch gives -30 penalty, so even with lower edit distance,
         // mismatched first letter should be heavily penalized
@@ -1632,16 +1646,16 @@ mod completion_scoring_tests {
         let query = chars("th");
 
         // Short common word (len=3)
-        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false);
+        let score_the = calculate_completion_score(&query, &chars("the"), 1, true, false, 0.0);
 
         // Medium common word (len=5)
-        let score_there = calculate_completion_score(&query, &chars("there"), 1, true, false);
+        let score_there = calculate_completion_score(&query, &chars("there"), 1, true, false, 0.0);
 
         // Long common word (len=7)
-        let score_through = calculate_completion_score(&query, &chars("through"), 1, true, false);
+        let score_through = calculate_completion_score(&query, &chars("through"), 1, true, false, 0.0);
 
         // Non-common word
-        let score_thy = calculate_completion_score(&query, &chars("thy"), 1, false, false);
+        let score_thy = calculate_completion_score(&query, &chars("thy"), 1, false, false, 0.0);
 
         // All common words should rank higher than non-common
         assert!(
@@ -1701,10 +1715,10 @@ mod completion_scoring_tests {
         let query = chars("test");
 
         // Difference at position 0 (beginning)
-        let score_beginning = calculate_completion_score(&query, &chars("best"), 1, false, false);
+        let score_beginning = calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
 
         // Difference at position 3 (end)
-        let score_end = calculate_completion_score(&query, &chars("text"), 1, false, false);
+        let score_end = calculate_completion_score(&query, &chars("text"), 1, false, false, 0.0);
 
         assert!(
             score_end > score_beginning,
@@ -1722,11 +1736,11 @@ mod completion_scoring_tests {
 
         // Test with ED=2 to avoid substring bonus complications
         // Same length (ED=2)
-        let score_same_len = calculate_completion_score(&query, &chars("xyz"), 2, false, false);
+        let score_same_len = calculate_completion_score(&query, &chars("xyz"), 2, false, false, 0.0);
         // +3 length (ED=2)
-        let score_len_plus_3 = calculate_completion_score(&query, &chars("xyzdef"), 2, false, false);
+        let score_len_plus_3 = calculate_completion_score(&query, &chars("xyzdef"), 2, false, false, 0.0);
         // +6 length (ED=2)
-        let score_len_plus_6 = calculate_completion_score(&query, &chars("xyzdefghi"), 2, false, false);
+        let score_len_plus_6 = calculate_completion_score(&query, &chars("xyzdefghi"), 2, false, false, 0.0);
 
         // Longer words should be penalized when other factors are similar
         assert!(
