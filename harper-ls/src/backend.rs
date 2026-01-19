@@ -838,7 +838,18 @@ impl Backend {
 
         // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
         // This is the same logic as generate_completion_list but without needing DocumentState
-        let fuzzy_completions = dict.fuzzy_match(&prefix, 2, 200);
+        // Use adaptive edit distance based on prefix length for better matching on longer words
+        // Short words (2-4 chars): distance 1 - very strict to avoid false matches
+        // Medium words (5-8 chars): distance 2 - balanced
+        // Long words (9-12 chars): distance 3 - allow more typos
+        // Very long words (13+ chars): distance 4 - accommodate multiple typos
+        let max_edit_distance = match prefix.len() {
+            0..=4 => 1,
+            5..=8 => 2,
+            9..=12 => 3,
+            _ => 4,
+        };
+        let fuzzy_completions = dict.fuzzy_match(&prefix, max_edit_distance, 200);
 
         // Helper function to check if word is a simple transposition of prefix
         let is_transposition = |word: &[char]| -> bool {
