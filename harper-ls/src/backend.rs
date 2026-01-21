@@ -834,11 +834,16 @@ impl Backend {
         // Extract the prefix being typed
         let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
 
-        // Log what we're completing
+        // Log what we're completing with context
         use tracing::info;
         let prefix_str: String = prefix.iter().collect();
+        let context_before: String = source[word_start.saturating_sub(10)..word_start].iter().collect();
+        let context_after: String = source[cursor_index..cursor_index.saturating_add(10).min(source.len())].iter().collect();
+
         info!("Completion request: prefix='{}', len={}", prefix_str, prefix.len());
         eprintln!("  Completing prefix: '{}' (len={})", prefix_str, prefix.len());
+        eprintln!("  Context: ...{:?}[{}]{:?}...", context_before, prefix_str, context_after);
+        eprintln!("  Position: cursor_index={}, word_start={}, source_len={}", cursor_index, word_start, source.len());
 
         // Don't show completions for very short prefixes
         if prefix.len() < completion_config.min_prefix_length {
@@ -918,6 +923,12 @@ impl Backend {
         completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         info!("Returning {} completions for '{}'", completions.len(), prefix_str);
+        eprintln!("  Found {} fuzzy matches, returning top {} completions",
+            completions.len(), completion_config.max_results.min(completions.len()));
+        if !completions.is_empty() {
+            eprintln!("  Top 5: {:?}",
+                completions.iter().take(5).map(|(w, s)| format!("{}({:.1})", w, s)).collect::<Vec<_>>());
+        }
 
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(&source, word_start);
@@ -1097,6 +1108,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let change_start = Instant::now();
         let Some(last) = params.content_changes.last() else {
             return;
         };
@@ -1104,11 +1116,19 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         let text = last.text.clone();
 
+        eprintln!("HARPER DID_CHANGE: version={:?}, text_len={}, last_40_chars={:?}",
+            params.text_document.version,
+            text.len(),
+            text.chars().rev().take(40).collect::<Vec<_>>().iter().rev().collect::<String>());
+
         // IMPORTANT: Update document content immediately (without debounce)
         // This ensures completions have access to the latest text while typing
         if let Err(err) = self.update_document(&uri, &text, None).await {
             error!("{err}")
         }
+
+        let change_elapsed = change_start.elapsed();
+        eprintln!("HARPER DID_CHANGE COMPLETE: version={:?}, took {:?}", params.text_document.version, change_elapsed);
 
         // Record this change with current timestamp for debounced diagnostics
         let now = Instant::now();
@@ -1381,28 +1401,55 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> JsonResult<Option<CompletionResponse>> {
+        let start_time = Instant::now();
+        eprintln!("\n========== HARPER COMPLETION START ==========");
         eprintln!("HARPER COMPLETION CALLED: pos={:?}, trigger={:?}",
             params.text_document_position.position,
             params.context.as_ref().map(|c| c.trigger_kind));
 
         // Check if cursor position might be ahead of document content
         // This happens when Helix sends completion before didChange
-        let needs_wait = {
+        // We need to check BEFORE position_to_index clamps the values
+        let (needs_wait, debug_info) = {
             let doc_states = self.doc_state.lock().await;
             if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
                 let source = doc_state.document.get_source();
-                let cursor_idx = doc_state.line_index.position_to_index(source, params.text_document_position.position);
-                // If cursor is at or past document end, we might be racing with didChange
-                cursor_idx >= source.len()
+                let position = params.text_document_position.position;
+
+                // Check if the requested position is beyond what we have in the document
+                let is_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
+
+                let debug = format!("pos={}:{}, doc_len={}, out_of_bounds={}",
+                    position.line, position.character, source.len(), is_out_of_bounds);
+                (is_out_of_bounds, debug)
             } else {
-                false
+                (false, "no_doc_state".to_string())
             }
         };
 
-        // If we're racing with didChange, wait a bit for the update to arrive
+        eprintln!("HARPER RACE CHECK: {}, needs_wait={}", debug_info, needs_wait);
+
+        // If we're racing with didChange, wait for the update to arrive
+        // Use a longer wait (100ms) and retry up to 3 times if needed
         if needs_wait {
             use tokio::time::{sleep, Duration};
-            sleep(Duration::from_millis(50)).await;
+            for attempt in 0..3 {
+                sleep(Duration::from_millis(100)).await;
+
+                // Check if document has caught up
+                let doc_states = self.doc_state.lock().await;
+                if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
+                    let source = doc_state.document.get_source();
+                    let position = params.text_document_position.position;
+
+                    let still_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
+
+                    if !still_out_of_bounds {
+                        eprintln!("HARPER RACE RESOLVED after {}ms", (attempt + 1) * 100);
+                        break;
+                    }
+                }
+            }
         }
 
         let completions = self
@@ -1412,11 +1459,13 @@ impl LanguageServer for Backend {
             )
             .await?;
 
+        let elapsed = start_time.elapsed();
         eprintln!("HARPER COMPLETION RESULT: {} items", completions.len());
         if !completions.is_empty() {
             eprintln!("  First 10 items: {:?}",
                 completions.iter().take(10).map(|c| &c.label).collect::<Vec<_>>());
         }
+        eprintln!("========== HARPER COMPLETION END (took {:?}) ==========\n", elapsed);
 
         if completions.is_empty() {
             Ok(None)

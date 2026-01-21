@@ -100,6 +100,28 @@ impl LineIndex {
         let end = self.position_to_index(source, range.end);
         Span::new(start, end)
     }
+
+    /// Check if a position is beyond the current document bounds.
+    /// Returns true if the position would be clamped by position_to_index.
+    /// Useful for detecting race conditions where completion requests arrive
+    /// before the corresponding didChange notification.
+    pub fn is_position_out_of_bounds(&self, source: &[char], position: Position) -> bool {
+        let line_idx = position.line as usize;
+
+        // Check if line exists
+        if let Some(&line_start) = self.line_starts.get(line_idx) {
+            let line_end = self.line_starts
+                .get(line_idx + 1)
+                .copied()
+                .unwrap_or(source.len());
+            let line_len = line_end - line_start;
+            // Position is out of bounds if character is beyond line length
+            position.character as usize > line_len
+        } else {
+            // Line doesn't exist - definitely out of bounds
+            true
+        }
+    }
 }
 
 pub fn span_to_range(source: &[char], span: Span<char>) -> Range {
