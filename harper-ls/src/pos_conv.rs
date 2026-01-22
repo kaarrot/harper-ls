@@ -114,8 +114,19 @@ impl LineIndex {
                 .get(line_idx + 1)
                 .copied()
                 .unwrap_or(source.len());
-            let line_len = line_end - line_start;
-            // Position is out of bounds if character is beyond line length
+
+            // Calculate line length for LSP purposes (excluding trailing newline)
+            // LSP character positions don't count the newline terminator
+            let raw_line_len = line_end - line_start;
+            let line_len = if raw_line_len > 0 && source.get(line_end - 1) == Some(&'\n') {
+                raw_line_len - 1
+            } else {
+                raw_line_len
+            };
+
+            // Position is out of bounds if character is beyond line content length
+            // Use >= because character N means "after N characters", so for a line
+            // with N characters, position N is at the end (valid), N+1 is out of bounds
             position.character as usize > line_len
         } else {
             // Line doesn't exist - definitely out of bounds

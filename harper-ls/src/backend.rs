@@ -538,14 +538,21 @@ impl Backend {
 
         let mut doc_lock = self.doc_state.lock().await;
 
-        if !exclude_patterns.is_empty()
-            && exclude_patterns.is_match(
-                uri.to_file_path()
-                    .ok_or_else(|| anyhow!("Unable to convert URI to file path."))?,
-            )
-        {
-            doc_lock.remove(uri);
-            return Ok(())
+        // Check exclude patterns - but only for URIs that can be converted to file paths
+        // Unsaved files might have URIs that don't map to real paths
+        if !exclude_patterns.is_empty() {
+            match uri.to_file_path() {
+                Some(path) if exclude_patterns.is_match(&path) => {
+                    eprintln!("HARPER: Excluding file due to pattern match: {:?}", uri);
+                    doc_lock.remove(uri);
+                    return Ok(());
+                }
+                None => {
+                    eprintln!("HARPER: URI has no file path (unsaved file?): {:?}", uri);
+                    // Continue processing - don't exclude unsaved files
+                }
+                _ => {}
+            }
         }
 
         let ignored_lints = self.load_ignored_lints(uri).await.unwrap_or_default();
@@ -578,6 +585,7 @@ impl Backend {
         }
 
         let Some(language_id) = &doc_state.language_id else {
+            eprintln!("HARPER: No language_id for document, removing: {:?}", uri);
             doc_lock.remove(uri);
             return Ok(())
         };
@@ -855,14 +863,14 @@ impl Backend {
         // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
         // This is the same logic as generate_completion_list but without needing DocumentState
         // Use adaptive edit distance based on prefix length for better matching on longer words
-        // Short words (2-4 chars): distance 1 - very strict to avoid false matches
-        // Medium words (5-8 chars): distance 2 - balanced
-        // Long words (9-12 chars): distance 3 - allow more typos
-        // Very long words (13+ chars): distance 4 - accommodate multiple typos
+        // Very short (2 chars): distance 1 - very strict to avoid noise
+        // Short words (3-5 chars): distance 2 - allow common typos like doubled letters (tthi→this)
+        // Medium words (6-9 chars): distance 3 - balanced
+        // Long words (10+ chars): distance 4 - accommodate multiple typos
         let max_edit_distance = match prefix.len() {
-            0..=4 => 1,
-            5..=8 => 2,
-            9..=12 => 3,
+            0..=2 => 1,
+            3..=5 => 2,
+            6..=9 => 3,
             _ => 4,
         };
         let fuzzy_completions = dict.fuzzy_match(&prefix, max_edit_distance, 200);
@@ -937,8 +945,14 @@ impl Backend {
         // This tells Helix that all our completions match the user's input
         let prefix_string: String = prefix.iter().collect();
 
+        eprintln!("  text_edit range: start={}:{}, end={}:{}, prefix='{}'",
+            word_start_position.line, word_start_position.character,
+            position.line, position.character,
+            prefix_string);
+
         // Convert to LSP completion items
-        // Use text_edit to replace the entire prefix
+        // Use text_edit to specify exact replacement range - this tells Helix what to replace
+        // Set filter_text to prefix so items aren't filtered out while typing
         let completion_items: Vec<CompletionItem> = completions
             .into_iter()
             .take(completion_config.max_results)
@@ -949,7 +963,8 @@ impl Backend {
                 CompletionItem {
                     label: word_string.clone(),
                     kind: Some(CompletionItemKind::TEXT),
-                    detail: Some("Dictionary".to_string()),
+                    detail: Some("Harper".to_string()),
+                    // text_edit specifies the exact range to replace
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: Range {
                             start: word_start_position,
@@ -957,8 +972,7 @@ impl Backend {
                         },
                         new_text: word_string.clone(),
                     })),
-                    // Set filterText to what the user typed so Helix doesn't filter it out
-                    // For "thiis", all completions get filterText="thiis" which matches user input
+                    // filter_text must match what user typed for Helix to show the item
                     filter_text: Some(prefix_string.clone()),
                     sort_text: Some(format!("{:05}", idx)),
                     ..Default::default()
@@ -1419,8 +1433,14 @@ impl LanguageServer for Backend {
                 // Check if the requested position is beyond what we have in the document
                 let is_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
 
-                let debug = format!("pos={}:{}, doc_len={}, out_of_bounds={}",
-                    position.line, position.character, source.len(), is_out_of_bounds);
+                // Get line content for debugging
+                let line_preview: String = source.iter()
+                    .skip(source.len().saturating_sub(20))
+                    .take(20)
+                    .collect();
+
+                let debug = format!("pos={}:{}, doc_len={}, out_of_bounds={}, tail={:?}",
+                    position.line, position.character, source.len(), is_out_of_bounds, line_preview);
                 (is_out_of_bounds, debug)
             } else {
                 (false, "no_doc_state".to_string())
@@ -1468,9 +1488,15 @@ impl LanguageServer for Backend {
         eprintln!("========== HARPER COMPLETION END (took {:?}) ==========\n", elapsed);
 
         if completions.is_empty() {
+            eprintln!("HARPER RETURNING: None (empty)");
             Ok(None)
         } else {
-            Ok(Some(CompletionResponse::Array(completions)))
+            use tower_lsp_server::lsp_types::CompletionList;
+            eprintln!("HARPER RETURNING: List with {} items, is_incomplete=false", completions.len());
+            Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items: completions,
+            })))
         }
     }
 
