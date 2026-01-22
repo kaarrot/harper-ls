@@ -1430,18 +1430,12 @@ impl LanguageServer for Backend {
                 let source = doc_state.document.get_source();
                 let position = params.text_document_position.position;
 
-                // Check if the requested position is beyond what we have in the document
-                let is_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
+                // Check if the requested position is beyond what the document currently contains
+                let out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
 
-                // Get line content for debugging
-                let line_preview: String = source.iter()
-                    .skip(source.len().saturating_sub(20))
-                    .take(20)
-                    .collect();
-
-                let debug = format!("pos={}:{}, doc_len={}, out_of_bounds={}, tail={:?}",
-                    position.line, position.character, source.len(), is_out_of_bounds, line_preview);
-                (is_out_of_bounds, debug)
+                let info = format!("pos={}:{}, source_len={}, out_of_bounds={}",
+                    position.line, position.character, source.len(), out_of_bounds);
+                (out_of_bounds, info)
             } else {
                 (false, "no_doc_state".to_string())
             }
@@ -1462,6 +1456,7 @@ impl LanguageServer for Backend {
                     let source = doc_state.document.get_source();
                     let position = params.text_document_position.position;
 
+                    // Check if position is still out of bounds
                     let still_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
 
                     if !still_out_of_bounds {
