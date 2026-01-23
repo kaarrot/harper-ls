@@ -795,7 +795,9 @@ impl Backend {
         // Also get lints to filter out misspelled words from completions
         let (source, dict, line_index, misspelled_words) = {
             let doc_states = self.doc_state.lock().await;
+            eprintln!("  Document states count: {}, looking for uri: {:?}", doc_states.len(), uri);
             let Some(doc_state) = doc_states.get(uri) else {
+                eprintln!("  ERROR: Document state not found for uri!");
                 return Ok(Vec::new());
             };
 
@@ -873,7 +875,9 @@ impl Backend {
             6..=9 => 3,
             _ => 4,
         };
+        eprintln!("  Using edit distance {} for prefix length {}", max_edit_distance, prefix.len());
         let fuzzy_completions = dict.fuzzy_match(&prefix, max_edit_distance, 200);
+        eprintln!("  Fuzzy match returned {} candidates", fuzzy_completions.len());
 
         // Helper function to check if word is a simple transposition of prefix
         let is_transposition = |word: &[char]| -> bool {
@@ -900,6 +904,8 @@ impl Backend {
             false
         };
 
+        eprintln!("  Misspelled words in document: {:?}", misspelled_words.iter().take(10).collect::<Vec<_>>());
+
         let mut completions: Vec<(String, f32)> = fuzzy_completions
             .into_iter()
             .filter_map(|fuzzy_match| {
@@ -908,6 +914,7 @@ impl Backend {
                 // Filter out words that are currently marked as misspelled in the document
                 // This prevents suggesting "tthis" when the user typed it earlier and it has an error
                 if misspelled_words.contains(&word_string.to_lowercase()) {
+                    eprintln!("    FILTERED OUT: '{}' (marked as misspelled)", word_string);
                     return None;
                 }
 
@@ -1444,11 +1451,12 @@ impl LanguageServer for Backend {
         eprintln!("HARPER RACE CHECK: {}, needs_wait={}", debug_info, needs_wait);
 
         // If we're racing with didChange, wait for the update to arrive
-        // Use a longer wait (100ms) and retry up to 3 times if needed
+        // Use short waits (10ms) and retry up to 5 times (max 50ms total)
+        // This prevents timeouts in editors like Helix that have short completion timeouts
         if needs_wait {
             use tokio::time::{sleep, Duration};
-            for attempt in 0..3 {
-                sleep(Duration::from_millis(100)).await;
+            for attempt in 0..5 {
+                sleep(Duration::from_millis(10)).await;
 
                 // Check if document has caught up
                 let doc_states = self.doc_state.lock().await;
@@ -1460,7 +1468,7 @@ impl LanguageServer for Backend {
                     let still_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
 
                     if !still_out_of_bounds {
-                        eprintln!("HARPER RACE RESOLVED after {}ms", (attempt + 1) * 100);
+                        eprintln!("HARPER RACE RESOLVED after {}ms", (attempt + 1) * 10);
                         break;
                     }
                 }
@@ -1487,9 +1495,11 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             use tower_lsp_server::lsp_types::CompletionList;
-            eprintln!("HARPER RETURNING: List with {} items, is_incomplete=false", completions.len());
+            eprintln!("HARPER RETURNING: List with {} items, is_incomplete=true", completions.len());
+            // Set is_incomplete=true to prevent Helix from doing its own client-side filtering
+            // We've already done fuzzy matching, so Helix should show our results as-is
             Ok(Some(CompletionResponse::List(CompletionList {
-                is_incomplete: false,
+                is_incomplete: true,
                 items: completions,
             })))
         }
