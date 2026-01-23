@@ -77,9 +77,9 @@ impl LineIndex {
         // Find character at requested column (handling UTF-16 encoding)
         let target_char_idx = position.character as usize;
 
-        if target_char_idx >= target_line.len() {
-            // Column is past end of line - return last char of line
-            return line_end.saturating_sub(1);
+        if target_char_idx > target_line.len() {
+            // Column is past end of line - clamp to end
+            return line_end;
         }
 
         line_start + target_char_idx
