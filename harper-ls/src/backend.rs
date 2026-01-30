@@ -957,6 +957,41 @@ impl Backend {
             position.line, position.character,
             prefix_string);
 
+        // Helper function to apply smart casing based on user's input pattern
+        // Preserves dictionary word casing while respecting user's capitalization intent
+        let apply_prefix_casing = |prefix: &[char], word: &str| -> String {
+            if prefix.is_empty() {
+                return word.to_string();
+            }
+
+            let word_chars: Vec<char> = word.chars().collect();
+
+            // Check the casing pattern of the prefix
+            let first_is_upper = prefix[0].is_uppercase();
+            let all_upper = prefix.iter().all(|c| !c.is_alphabetic() || c.is_uppercase());
+
+            // If all typed characters are uppercase, return all uppercase
+            if all_upper && prefix.iter().any(|c| c.is_alphabetic()) {
+                return word.to_uppercase();
+            }
+
+            // If only first character is uppercase, capitalize first letter of word
+            if first_is_upper {
+                let mut result = String::new();
+                for (i, ch) in word_chars.iter().enumerate() {
+                    if i == 0 {
+                        result.push(ch.to_uppercase().next().unwrap_or(*ch));
+                    } else {
+                        result.push(*ch);
+                    }
+                }
+                return result;
+            }
+
+            // Otherwise (all lowercase or mixed), keep original word casing
+            word.to_string()
+        };
+
         // Convert to LSP completion items
         // Use text_edit to specify exact replacement range - this tells Helix what to replace
         // Set filter_text to prefix so items aren't filtered out while typing
@@ -966,6 +1001,9 @@ impl Backend {
             .enumerate()
             .map(|(idx, (word_string, _))| {
                 use tower_lsp_server::lsp_types::{Range, TextEdit, CompletionTextEdit};
+
+                // Apply the casing from the user's prefix to the completion
+                let completion_text = apply_prefix_casing(&prefix, &word_string);
 
                 CompletionItem {
                     label: word_string.clone(),
@@ -977,7 +1015,7 @@ impl Backend {
                             start: word_start_position,
                             end: position,
                         },
-                        new_text: word_string.clone(),
+                        new_text: completion_text,
                     })),
                     // filter_text must match what user typed for Helix to show the item
                     filter_text: Some(prefix_string.clone()),
