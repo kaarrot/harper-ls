@@ -1095,7 +1095,8 @@ impl LanguageServer for Backend {
                             .map(String::from)
                             .collect(),
                     ),
-                    all_commit_characters: None,
+                    // Space auto-accepts first suggestion for natural spell-checker flow
+                    all_commit_characters: Some(vec![" ".to_string()]),
                     work_done_progress_options: Default::default(),
                     completion_item: None,
                 }),
