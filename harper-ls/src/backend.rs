@@ -795,9 +795,7 @@ impl Backend {
         // Also get lints to filter out misspelled words from completions
         let (source, dict, line_index, misspelled_words) = {
             let doc_states = self.doc_state.lock().await;
-            eprintln!("  Document states count: {}, looking for uri: {:?}", doc_states.len(), uri);
             let Some(doc_state) = doc_states.get(uri) else {
-                eprintln!("  ERROR: Document state not found for uri!");
                 return Ok(Vec::new());
             };
 
@@ -816,10 +814,10 @@ impl Backend {
                             _ => false,
                         })
                 })
-                .filter_map(|diag| {
+                .map(|diag| {
                     let span = crate::pos_conv::range_to_span(doc_source, diag.range);
                     let word: String = span.get_content(doc_source).iter().collect();
-                    Some(word.to_lowercase())
+                    word.to_lowercase()
                 })
                 .collect();
 
@@ -844,23 +842,12 @@ impl Backend {
         // Extract the prefix being typed
         let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
 
-        // Log what we're completing with context
-        use tracing::info;
-        let prefix_str: String = prefix.iter().collect();
-        let context_before: String = source[word_start.saturating_sub(10)..word_start].iter().collect();
-        let context_after: String = source[cursor_index..cursor_index.saturating_add(10).min(source.len())].iter().collect();
-
-        info!("Completion request: prefix='{}', len={}", prefix_str, prefix.len());
-        eprintln!("  Completing prefix: '{}' (len={})", prefix_str, prefix.len());
-        eprintln!("  Context: ...{:?}[{}]{:?}...", context_before, prefix_str, context_after);
-        eprintln!("  Position: cursor_index={}, word_start={}, source_len={}", cursor_index, word_start, source.len());
-
         // Don't show completions for very short prefixes
         if prefix.len() < completion_config.min_prefix_length {
-            info!("Prefix too short, skipping");
-            eprintln!("  Prefix too short (min={})", completion_config.min_prefix_length);
             return Ok(Vec::new());
         }
+
+        let prefix_str: String = prefix.iter().collect();
 
         // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
         // This is the same logic as generate_completion_list but without needing DocumentState
@@ -875,9 +862,7 @@ impl Backend {
             6..=9 => 3,
             _ => 4,
         };
-        eprintln!("  Using edit distance {} for prefix length {}", max_edit_distance, prefix.len());
         let fuzzy_completions = dict.fuzzy_match(&prefix, max_edit_distance, 200);
-        eprintln!("  Fuzzy match returned {} candidates", fuzzy_completions.len());
 
         // Helper function to check if word is a simple transposition of prefix
         let is_transposition = |word: &[char]| -> bool {
@@ -904,8 +889,6 @@ impl Backend {
             false
         };
 
-        eprintln!("  Misspelled words in document: {:?}", misspelled_words.iter().take(10).collect::<Vec<_>>());
-
         let mut completions: Vec<(String, f32)> = fuzzy_completions
             .into_iter()
             .filter_map(|fuzzy_match| {
@@ -914,7 +897,6 @@ impl Backend {
                 // Filter out words that are currently marked as misspelled in the document
                 // This prevents suggesting "tthis" when the user typed it earlier and it has an error
                 if misspelled_words.contains(&word_string.to_lowercase()) {
-                    eprintln!("    FILTERED OUT: '{}' (marked as misspelled)", word_string);
                     return None;
                 }
 
@@ -937,25 +919,12 @@ impl Backend {
 
         completions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        info!("Returning {} completions for '{}'", completions.len(), prefix_str);
-        eprintln!("  Found {} fuzzy matches, returning top {} completions",
-            completions.len(), completion_config.max_results.min(completions.len()));
-        if !completions.is_empty() {
-            eprintln!("  Top 5: {:?}",
-                completions.iter().take(5).map(|(w, s)| format!("{}({:.1})", w, s)).collect::<Vec<_>>());
-        }
-
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(&source, word_start);
 
         // Convert prefix to string - we'll use this as filterText
         // This tells Helix that all our completions match the user's input
         let prefix_string: String = prefix.iter().collect();
-
-        eprintln!("  text_edit range: start={}:{}, end={}:{}, prefix='{}'",
-            word_start_position.line, word_start_position.character,
-            position.line, position.character,
-            prefix_string);
 
         // Helper function to apply smart casing based on user's input pattern
         // Preserves dictionary word casing while respecting user's capitalization intent
@@ -1461,53 +1430,32 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> JsonResult<Option<CompletionResponse>> {
-        let start_time = Instant::now();
-        eprintln!("\n========== HARPER COMPLETION START ==========");
-        eprintln!("HARPER COMPLETION CALLED: pos={:?}, trigger={:?}",
-            params.text_document_position.position,
-            params.context.as_ref().map(|c| c.trigger_kind));
-
-        // Check if cursor position might be ahead of document content
-        // This happens when Helix sends completion before didChange
-        // We need to check BEFORE position_to_index clamps the values
-        let (needs_wait, debug_info) = {
+        // Check if cursor position might be ahead of document content.
+        // This happens when Helix sends completion before didChange.
+        let needs_wait = {
             let doc_states = self.doc_state.lock().await;
             if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
                 let source = doc_state.document.get_source();
                 let position = params.text_document_position.position;
-
-                // Check if the requested position is beyond what the document currently contains
-                let out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
-
-                let info = format!("pos={}:{}, source_len={}, out_of_bounds={}",
-                    position.line, position.character, source.len(), out_of_bounds);
-                (out_of_bounds, info)
+                doc_state.line_index.is_position_out_of_bounds(source, position)
             } else {
-                (false, "no_doc_state".to_string())
+                false
             }
         };
 
-        eprintln!("HARPER RACE CHECK: {}, needs_wait={}", debug_info, needs_wait);
-
-        // If we're racing with didChange, wait for the update to arrive
-        // Use short waits (10ms) and retry up to 5 times (max 50ms total)
-        // This prevents timeouts in editors like Helix that have short completion timeouts
+        // If we're racing with didChange, wait for the update to arrive.
+        // Use short waits (10ms) and retry up to 5 times (max 50ms total).
         if needs_wait {
             use tokio::time::{sleep, Duration};
-            for attempt in 0..5 {
+            for _attempt in 0..5 {
                 sleep(Duration::from_millis(10)).await;
 
-                // Check if document has caught up
                 let doc_states = self.doc_state.lock().await;
                 if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
                     let source = doc_state.document.get_source();
                     let position = params.text_document_position.position;
 
-                    // Check if position is still out of bounds
-                    let still_out_of_bounds = doc_state.line_index.is_position_out_of_bounds(source, position);
-
-                    if !still_out_of_bounds {
-                        eprintln!("HARPER RACE RESOLVED after {}ms", (attempt + 1) * 10);
+                    if !doc_state.line_index.is_position_out_of_bounds(source, position) {
                         break;
                     }
                 }
@@ -1521,22 +1469,10 @@ impl LanguageServer for Backend {
             )
             .await?;
 
-        let elapsed = start_time.elapsed();
-        eprintln!("HARPER COMPLETION RESULT: {} items", completions.len());
-        if !completions.is_empty() {
-            eprintln!("  First 10 items: {:?}",
-                completions.iter().take(10).map(|c| &c.label).collect::<Vec<_>>());
-        }
-        eprintln!("========== HARPER COMPLETION END (took {:?}) ==========\n", elapsed);
-
         if completions.is_empty() {
-            eprintln!("HARPER RETURNING: None (empty)");
             Ok(None)
         } else {
             use tower_lsp_server::lsp_types::CompletionList;
-            eprintln!("HARPER RETURNING: List with {} items, is_incomplete=true", completions.len());
-            // Set is_incomplete=true to prevent Helix from doing its own client-side filtering
-            // We've already done fuzzy matching, so Helix should show our results as-is
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items: completions,
