@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::config::{CodeActionConfig, DiagnosticSeverity};
 use crate::diagnostics::{lint_to_code_actions, lints_to_diagnostics};
-use crate::pos_conv::{range_to_span, LineIndex};
+use crate::pos_conv::{LineIndex, range_to_span};
 use harper_core::linting::{Lint, LintGroup, Linter};
 use harper_core::spell::{MergedDictionary, MutableDictionary};
 use harper_core::{Document, IgnoredLints, TokenKind, remove_overlaps_map};
@@ -17,6 +20,7 @@ pub struct DocumentState {
     pub uri: Uri,
     pub line_index: LineIndex,
     pub last_diagnostics: Vec<Diagnostic>,
+    pub misspelled_words: Arc<HashSet<String>>,
 }
 
 impl DocumentState {
@@ -107,6 +111,7 @@ impl Default for DocumentState {
             uri: "https://example.net".parse().unwrap(),
             line_index: Default::default(),
             last_diagnostics: Vec::new(),
+            misspelled_words: Arc::new(HashSet::new()),
         }
     }
 }

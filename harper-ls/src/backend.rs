@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -14,14 +14,12 @@ use crate::io_utils::fileify_path;
 use anyhow::{Context, Result, anyhow};
 use futures::future::join;
 use harper_comments::CommentParser;
+use harper_core::keyboard_distance::avg_keyboard_distance;
 use harper_core::linting::{LintGroup, LintGroupConfig};
 use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
 };
-use harper_core::spell::{
-    Dictionary, FstDictionary, MergedDictionary, MutableDictionary,
-};
-use harper_core::keyboard_distance::avg_keyboard_distance;
+use harper_core::spell::{Dictionary, FstDictionary, MergedDictionary, MutableDictionary};
 use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
@@ -31,8 +29,8 @@ use harper_python::PythonParser;
 use harper_stats::{Record, Stats};
 use harper_typst::Typst;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tower_lsp_server::jsonrpc::Result as JsonResult;
 use tower_lsp_server::lsp_types::notification::PublishDiagnostics;
 use tower_lsp_server::lsp_types::{
@@ -63,6 +61,11 @@ struct DictCacheEntry {
     file_dict_mtime: Option<SystemTime>,
 }
 
+#[derive(Clone)]
+struct InFlightChange {
+    notify: Arc<Notify>,
+}
+
 pub struct Backend {
     client: Client,
     root: RwLock<PathBuf>,
@@ -71,6 +74,7 @@ pub struct Backend {
     doc_state: Mutex<HashMap<Uri, DocumentState>>,
     pending_changes: RwLock<HashMap<Uri, Instant>>,
     dict_cache: RwLock<HashMap<Uri, DictCacheEntry>>,
+    in_flight_changes: RwLock<HashMap<Uri, InFlightChange>>,
 }
 
 /// Calculate a completion score for ranking suggestions.
@@ -174,9 +178,9 @@ fn calculate_completion_score(
     let len_diff = (candidate.len() as i32 - query.len() as i32).abs();
     score -= match len_diff {
         0 => 0.0,
-        1 => 8.0,   // Moderate penalty for 1-char difference
-        2 => 25.0,  // Stronger penalty for 2-char difference
-        3 => 40.0,  // Even stronger for 3-char difference
+        1 => 8.0,  // Moderate penalty for 1-char difference
+        2 => 25.0, // Stronger penalty for 2-char difference
+        3 => 40.0, // Even stronger for 3-char difference
         _ => (len_diff as f32) * 15.0,
     };
 
@@ -273,6 +277,37 @@ fn calculate_char_frequency_similarity(a: &[char], b: &[char]) -> f32 {
     1.0 - (diff_sum as f32 / max_diff).min(1.0)
 }
 
+fn extract_misspelled_words(
+    source: &[char],
+    line_index: &crate::pos_conv::LineIndex,
+    diagnostics: &[Diagnostic],
+) -> HashSet<String> {
+    use tower_lsp_server::lsp_types::NumberOrString;
+
+    diagnostics
+        .iter()
+        .filter(|diag| {
+            diag.code.as_ref().is_some_and(|code| match code {
+                NumberOrString::String(s) => s.contains("Spelling"),
+                _ => false,
+            })
+        })
+        .filter_map(|diag| {
+            let span = line_index.range_to_span(source, diag.range);
+            if span.start >= span.end || span.end > source.len() {
+                return None;
+            }
+
+            let word: String = span.get_content(source).iter().collect();
+            if word.is_empty() {
+                None
+            } else {
+                Some(word.to_lowercase())
+            }
+        })
+        .collect()
+}
+
 impl Backend {
     pub fn new(client: Client, config: Config) -> Self {
         Self {
@@ -283,6 +318,7 @@ impl Backend {
             doc_state: Mutex::new(HashMap::new()),
             pending_changes: RwLock::new(HashMap::new()),
             dict_cache: RwLock::new(HashMap::new()),
+            in_flight_changes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -362,7 +398,7 @@ impl Backend {
         .context("Unable to save the dictionary to path.")
     }
 
-    async fn load_user_dictionary(&self, ) -> MutableDictionary {
+    async fn load_user_dictionary(&self) -> MutableDictionary {
         let config = self.config.read().await;
 
         load_dict(&config.user_dict_path, self.config.read().await.dialect)
@@ -445,7 +481,10 @@ impl Backend {
         // Get dictionary paths from config
         let (user_dict_path, workspace_dict_path) = {
             let config = self.config.read().await;
-            (config.user_dict_path.clone(), config.workspace_dict_path.clone())
+            (
+                config.user_dict_path.clone(),
+                config.workspace_dict_path.clone(),
+            )
         };
         let file_dict_path = self.get_file_dict_path(uri).await.ok();
 
@@ -587,7 +626,7 @@ impl Backend {
         let Some(language_id) = &doc_state.language_id else {
             eprintln!("HARPER: No language_id for document, removing: {:?}", uri);
             doc_lock.remove(uri);
-            return Ok(())
+            return Ok(());
         };
 
         async fn use_ident_dict<'a>(
@@ -748,7 +787,13 @@ impl Backend {
                     // Identical diagnostics - skip publishing
                     false
                 } else {
-                    // Different diagnostics - update cache and publish
+                    // Different diagnostics - update cached diagnostics and misspelled words
+                    let source = doc_state.document.get_source();
+                    doc_state.misspelled_words = Arc::new(extract_misspelled_words(
+                        source,
+                        &doc_state.line_index,
+                        &diagnostics,
+                    ));
                     doc_state.last_diagnostics = diagnostics.clone();
                     true
                 }
@@ -774,6 +819,28 @@ impl Backend {
             .await;
     }
 
+    async fn wait_for_in_flight_change(&self, uri: &Uri) {
+        // Wait for currently running didChange processing to finish.
+        // Wakeups are notify-driven (no fixed sleep), with a timeout as fallback.
+        for _ in 0..3 {
+            let notify = {
+                let in_flight = self.in_flight_changes.read().await;
+                in_flight.get(uri).map(|state| state.notify.clone())
+            };
+
+            let Some(notify) = notify else {
+                return;
+            };
+
+            if timeout(Duration::from_millis(250), notify.notified())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     /// Generate completion suggestions based on the current cursor position
     async fn generate_completions(
         &self,
@@ -790,42 +857,19 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        // Copy needed data while holding lock, then release it before expensive operations
-        // This follows the pattern from commits 6760b477 and e4251ac2
-        // Also get lints to filter out misspelled words from completions
+        // Copy needed data while holding lock, then release it before expensive operations.
         let (source, dict, line_index, misspelled_words) = {
             let doc_states = self.doc_state.lock().await;
             let Some(doc_state) = doc_states.get(uri) else {
                 return Ok(Vec::new());
             };
-
-            // Extract misspelled words from diagnostics
-            // These are words that currently have spelling errors in the document
-            use tower_lsp_server::lsp_types::NumberOrString;
             let doc_source = doc_state.document.get_source();
-            let misspelled: std::collections::HashSet<String> = doc_state
-                .last_diagnostics
-                .iter()
-                .filter(|diag| {
-                    diag.code
-                        .as_ref()
-                        .map_or(false, |code| match code {
-                            NumberOrString::String(s) => s.contains("Spelling"),
-                            _ => false,
-                        })
-                })
-                .map(|diag| {
-                    let span = crate::pos_conv::range_to_span(doc_source, diag.range);
-                    let word: String = span.get_content(doc_source).iter().collect();
-                    word.to_lowercase()
-                })
-                .collect();
 
             (
                 doc_source.iter().copied().collect::<Vec<char>>(),
                 doc_state.dict.clone(),
                 doc_state.line_index.clone(),
-                misspelled,
+                doc_state.misspelled_words.clone(),
             )
         }; // Lock released here
 
@@ -846,8 +890,6 @@ impl Backend {
         if prefix.len() < completion_config.min_prefix_length {
             return Ok(Vec::new());
         }
-
-        let prefix_str: String = prefix.iter().collect();
 
         // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
         // This is the same logic as generate_completion_list but without needing DocumentState
@@ -921,6 +963,7 @@ impl Backend {
 
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(&source, word_start);
+        let cursor_position = line_index.index_to_position(&source, cursor_index);
 
         // Convert prefix to string - we'll use this as filterText
         // This tells Helix that all our completions match the user's input
@@ -937,7 +980,9 @@ impl Backend {
 
             // Check the casing pattern of the prefix
             let first_is_upper = prefix[0].is_uppercase();
-            let all_upper = prefix.iter().all(|c| !c.is_alphabetic() || c.is_uppercase());
+            let all_upper = prefix
+                .iter()
+                .all(|c| !c.is_alphabetic() || c.is_uppercase());
 
             // If all typed characters are uppercase, return all uppercase
             if all_upper && prefix.iter().any(|c| c.is_alphabetic()) {
@@ -969,7 +1014,7 @@ impl Backend {
             .take(completion_config.max_results)
             .enumerate()
             .map(|(idx, (word_string, _))| {
-                use tower_lsp_server::lsp_types::{Range, TextEdit, CompletionTextEdit};
+                use tower_lsp_server::lsp_types::{CompletionTextEdit, Range, TextEdit};
 
                 // Apply the casing from the user's prefix to the completion
                 let completion_text = apply_prefix_casing(&prefix, &word_string);
@@ -982,7 +1027,7 @@ impl Backend {
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: Range {
                             start: word_start_position,
-                            end: position,
+                            end: cursor_position,
                         },
                         new_text: completion_text,
                     })),
@@ -1144,11 +1189,36 @@ impl LanguageServer for Backend {
 
         let uri = params.text_document.uri.clone();
         let text = last.text.clone();
+        let change_notify = Arc::new(Notify::new());
 
-        eprintln!("HARPER DID_CHANGE: version={:?}, text_len={}, last_40_chars={:?}",
+        eprintln!(
+            "HARPER DID_CHANGE: version={:?}, text_len={}, last_40_chars={:?}",
             params.text_document.version,
             text.len(),
-            text.chars().rev().take(40).collect::<Vec<_>>().iter().rev().collect::<String>());
+            text.chars()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .iter()
+                .rev()
+                .collect::<String>()
+        );
+
+        // Mark this URI as actively updating so completion requests can wait on a notification
+        // instead of sleeping for a fixed duration.
+        if let Some(previous_notify) = {
+            let mut in_flight = self.in_flight_changes.write().await;
+            in_flight
+                .insert(
+                    uri.clone(),
+                    InFlightChange {
+                        notify: change_notify.clone(),
+                    },
+                )
+                .map(|old| old.notify)
+        } {
+            previous_notify.notify_waiters();
+        }
 
         // IMPORTANT: Update document content immediately (without debounce)
         // This ensures completions have access to the latest text while typing
@@ -1156,8 +1226,26 @@ impl LanguageServer for Backend {
             error!("{err}")
         }
 
+        // Signal completion requests waiting on this update.
+        if let Some(done_notify) = {
+            let mut in_flight = self.in_flight_changes.write().await;
+            if in_flight
+                .get(&uri)
+                .is_some_and(|state| Arc::ptr_eq(&state.notify, &change_notify))
+            {
+                in_flight.remove(&uri).map(|state| state.notify)
+            } else {
+                None
+            }
+        } {
+            done_notify.notify_waiters();
+        }
+
         let change_elapsed = change_start.elapsed();
-        eprintln!("HARPER DID_CHANGE COMPLETE: version={:?}, took {:?}", params.text_document.version, change_elapsed);
+        eprintln!(
+            "HARPER DID_CHANGE COMPLETE: version={:?}, took {:?}",
+            params.text_document.version, change_elapsed
+        );
 
         // Record this change with current timestamp for debounced diagnostics
         let now = Instant::now();
@@ -1173,7 +1261,9 @@ impl LanguageServer for Backend {
         // Check if this is still the latest change for this URI
         let should_process = {
             let pending = self.pending_changes.read().await;
-            pending.get(&uri).map_or(false, |&timestamp| timestamp == now)
+            pending
+                .get(&uri)
+                .map_or(false, |&timestamp| timestamp == now)
         };
 
         if !should_process {
@@ -1195,6 +1285,19 @@ impl LanguageServer for Backend {
         let uri = _params.text_document.uri;
         let mut doc_lock = self.doc_state.lock().await;
         doc_lock.remove(&uri);
+        drop(doc_lock);
+
+        {
+            let mut pending = self.pending_changes.write().await;
+            pending.remove(&uri);
+        }
+
+        if let Some(change) = {
+            let mut in_flight = self.in_flight_changes.write().await;
+            in_flight.remove(&uri)
+        } {
+            change.notify.notify_waiters();
+        }
 
         self.client
             .send_notification::<PublishDiagnostics>(PublishDiagnosticsParams {
@@ -1426,41 +1529,9 @@ impl LanguageServer for Backend {
         Ok(Some(actions))
     }
 
-    async fn completion(
-        &self,
-        params: CompletionParams,
-    ) -> JsonResult<Option<CompletionResponse>> {
-        // Check if cursor position might be ahead of document content.
-        // This happens when Helix sends completion before didChange.
-        let needs_wait = {
-            let doc_states = self.doc_state.lock().await;
-            if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
-                let source = doc_state.document.get_source();
-                let position = params.text_document_position.position;
-                doc_state.line_index.is_position_out_of_bounds(source, position)
-            } else {
-                false
-            }
-        };
-
-        // If we're racing with didChange, wait for the update to arrive.
-        // Use short waits (10ms) and retry up to 5 times (max 50ms total).
-        if needs_wait {
-            use tokio::time::{sleep, Duration};
-            for _attempt in 0..5 {
-                sleep(Duration::from_millis(10)).await;
-
-                let doc_states = self.doc_state.lock().await;
-                if let Some(doc_state) = doc_states.get(&params.text_document_position.text_document.uri) {
-                    let source = doc_state.document.get_source();
-                    let position = params.text_document_position.position;
-
-                    if !doc_state.line_index.is_position_out_of_bounds(source, position) {
-                        break;
-                    }
-                }
-            }
-        }
+    async fn completion(&self, params: CompletionParams) -> JsonResult<Option<CompletionResponse>> {
+        self.wait_for_in_flight_change(&params.text_document_position.text_document.uri)
+            .await;
 
         let completions = self
             .generate_completions(
@@ -1580,7 +1651,8 @@ mod completion_scoring_tests {
         let query = chars("teh");
 
         // "the" with transposition detected
-        let score_transposition = calculate_completion_score(&query, &chars("the"), 1, true, true, 0.0);
+        let score_transposition =
+            calculate_completion_score(&query, &chars("the"), 1, true, true, 0.0);
 
         // "tea" without transposition (also edit distance 1)
         let score_no_transposition =
@@ -1629,7 +1701,8 @@ mod completion_scoring_tests {
         // Query contained as substring should get bonus
         // "his" is a substring of "this"
         let query = chars("his");
-        let score_substring = calculate_completion_score(&query, &chars("this"), 1, true, false, 0.0);
+        let score_substring =
+            calculate_completion_score(&query, &chars("this"), 1, true, false, 0.0);
 
         let query2 = chars("wor");
         let score_word = calculate_completion_score(&query2, &chars("word"), 1, false, false, 0.0);
@@ -1683,7 +1756,8 @@ mod completion_scoring_tests {
         let query = chars("test");
 
         let score_match = calculate_completion_score(&query, &chars("test"), 0, false, false, 0.0);
-        let score_mismatch = calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
+        let score_mismatch =
+            calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
 
         // First letter mismatch gives -30 penalty, so even with lower edit distance,
         // mismatched first letter should be heavily penalized
@@ -1707,7 +1781,8 @@ mod completion_scoring_tests {
         let score_there = calculate_completion_score(&query, &chars("there"), 1, true, false, 0.0);
 
         // Long common word (len=7)
-        let score_through = calculate_completion_score(&query, &chars("through"), 1, true, false, 0.0);
+        let score_through =
+            calculate_completion_score(&query, &chars("through"), 1, true, false, 0.0);
 
         // Non-common word
         let score_thy = calculate_completion_score(&query, &chars("thy"), 1, false, false, 0.0);
@@ -1770,7 +1845,8 @@ mod completion_scoring_tests {
         let query = chars("test");
 
         // Difference at position 0 (beginning)
-        let score_beginning = calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
+        let score_beginning =
+            calculate_completion_score(&query, &chars("best"), 1, false, false, 0.0);
 
         // Difference at position 3 (end)
         let score_end = calculate_completion_score(&query, &chars("text"), 1, false, false, 0.0);
@@ -1791,11 +1867,14 @@ mod completion_scoring_tests {
 
         // Test with ED=2 to avoid substring bonus complications
         // Same length (ED=2)
-        let score_same_len = calculate_completion_score(&query, &chars("xyz"), 2, false, false, 0.0);
+        let score_same_len =
+            calculate_completion_score(&query, &chars("xyz"), 2, false, false, 0.0);
         // +3 length (ED=2)
-        let score_len_plus_3 = calculate_completion_score(&query, &chars("xyzdef"), 2, false, false, 0.0);
+        let score_len_plus_3 =
+            calculate_completion_score(&query, &chars("xyzdef"), 2, false, false, 0.0);
         // +6 length (ED=2)
-        let score_len_plus_6 = calculate_completion_score(&query, &chars("xyzdefghi"), 2, false, false, 0.0);
+        let score_len_plus_6 =
+            calculate_completion_score(&query, &chars("xyzdefghi"), 2, false, false, 0.0);
 
         // Longer words should be penalized when other factors are similar
         assert!(
@@ -1812,4 +1891,3 @@ mod completion_scoring_tests {
         );
     }
 }
-

@@ -36,7 +36,7 @@ impl LineIndex {
     pub fn index_to_position(&self, source: &[char], index: usize) -> Position {
         // Binary search to find which line contains this index
         let line = match self.line_starts.binary_search(&index) {
-            Ok(line) => line, // Exact match - index is at start of line
+            Ok(line) => line,                    // Exact match - index is at start of line
             Err(line) => line.saturating_sub(1), // Index is within previous line
         };
 
@@ -67,7 +67,8 @@ impl LineIndex {
         };
 
         // Find where this line ends (at next line start or end of source)
-        let line_end = self.line_starts
+        let line_end = self
+            .line_starts
             .get(line_idx + 1)
             .copied()
             .unwrap_or(source.len());
@@ -105,12 +106,14 @@ impl LineIndex {
     /// Returns true if the position would be clamped by position_to_index.
     /// Useful for detecting race conditions where completion requests arrive
     /// before the corresponding didChange notification.
+    #[allow(dead_code)]
     pub fn is_position_out_of_bounds(&self, source: &[char], position: Position) -> bool {
         let line_idx = position.line as usize;
 
         // Check if line exists
         if let Some(&line_start) = self.line_starts.get(line_idx) {
-            let line_end = self.line_starts
+            let line_end = self
+                .line_starts
                 .get(line_idx + 1)
                 .copied()
                 .unwrap_or(source.len());
