@@ -66,6 +66,9 @@ struct InFlightChange {
     notify: Arc<Notify>,
 }
 
+const MISSPELLED_REFRESH_DEBOUNCE_MS: u64 = 75;
+const DIAGNOSTICS_PUBLISH_DEBOUNCE_MS: u64 = 300;
+
 pub struct Backend {
     client: Client,
     root: RwLock<PathBuf>,
@@ -610,17 +613,21 @@ impl Backend {
                 linter: LintGroup::new_curated(dict.clone(), dialect)
                     .with_lint_config(lint_config.clone()),
                 language_id: language_id.map(|v| v.to_string()),
-                dict: dict.clone(),
+                completion_dict: dict.clone(),
+                lint_dict: dict.clone(),
                 uri: uri.clone(),
                 ..Default::default()
             }
         });
 
-        if doc_state.dict != dict {
-            doc_state.dict = dict.clone();
+        if doc_state.completion_dict != dict {
+            doc_state.completion_dict = dict.clone();
+            let mut merged = (*doc_state.completion_dict).clone();
+            merged.add_dictionary(doc_state.ident_dict.clone());
+            doc_state.lint_dict = Arc::new(merged);
             info!("Constructing new linter because of modified dictionary.");
-            doc_state.linter =
-                LintGroup::new_curated(dict.clone(), dialect).with_lint_config(lint_config.clone());
+            doc_state.linter = LintGroup::new_curated(doc_state.lint_dict.clone(), dialect)
+                .with_lint_config(lint_config.clone());
         }
 
         let Some(language_id) = &doc_state.language_id else {
@@ -629,12 +636,10 @@ impl Backend {
             return Ok(());
         };
 
-        async fn use_ident_dict<'a>(
-            backend: &'a Backend,
+        fn use_ident_dict(
             new_dict: Arc<MutableDictionary>,
             parser: impl Parser + 'static,
-            uri: &'a Uri,
-            doc_state: &'a mut DocumentState,
+            doc_state: &mut DocumentState,
             lint_config: &LintGroupConfig,
             dialect: Dialect,
         ) -> Result<Box<dyn Parser>> {
@@ -642,18 +647,18 @@ impl Backend {
                 info!("Constructing new linter because of modified ident dictionary.");
                 doc_state.ident_dict = new_dict.clone();
 
-                let mut merged = backend.generate_file_dictionary(uri).await?;
+                let mut merged = (*doc_state.completion_dict).clone();
                 merged.add_dictionary(new_dict);
                 let merged = Arc::new(merged);
 
                 doc_state.linter = LintGroup::new_curated(merged.clone(), dialect)
                     .with_lint_config(lint_config.clone());
-                doc_state.dict = merged.clone();
+                doc_state.lint_dict = merged.clone();
             }
 
             Ok(Box::new(CollapseIdentifiers::new(
                 Box::new(parser),
-                Box::new(doc_state.dict.clone()),
+                Box::new(doc_state.lint_dict.clone()),
             )))
         }
 
@@ -664,18 +669,13 @@ impl Backend {
                 let ts_parser = ts_parser.unwrap();
 
                 if let Some(new_dict) = ts_parser.create_ident_dict(&Arc::new(source)) {
-                    Some(
-                        use_ident_dict(
-                            self,
-                            Arc::new(new_dict),
-                            ts_parser,
-                            uri,
-                            doc_state,
-                            &lint_config,
-                            dialect,
-                        )
-                        .await?,
-                    )
+                    Some(use_ident_dict(
+                        Arc::new(new_dict),
+                        ts_parser,
+                        doc_state,
+                        &lint_config,
+                        dialect,
+                    )?)
                 } else {
                     Some(Box::new(ts_parser))
                 }
@@ -694,18 +694,13 @@ impl Backend {
                 if let Some(new_dict) =
                     parser.create_ident_dict(&Arc::new(source), markdown_options)
                 {
-                    Some(
-                        use_ident_dict(
-                            self,
-                            Arc::new(new_dict),
-                            parser,
-                            uri,
-                            doc_state,
-                            &lint_config,
-                            dialect,
-                        )
-                        .await?,
-                    )
+                    Some(use_ident_dict(
+                        Arc::new(new_dict),
+                        parser,
+                        doc_state,
+                        &lint_config,
+                        dialect,
+                    )?)
                 } else {
                     Some(Box::new(parser))
                 }
@@ -725,12 +720,12 @@ impl Backend {
             }
             Some(mut parser) => {
                 if isolate_english {
-                    parser = Box::new(IsolateEnglish::new(parser, doc_state.dict.clone()));
+                    parser = Box::new(IsolateEnglish::new(parser, doc_state.lint_dict.clone()));
                 }
 
                 // Don't lint on documents larger than the configured maximum length.
                 if text.len() <= max_file_length {
-                    doc_state.document = Document::new(text, &parser, &doc_state.dict);
+                    doc_state.document = Document::new(text, &parser, &doc_state.lint_dict);
                 } else {
                     // Ensures that existing lints are cleared when we stop linting the file.
                     // Otherwise, prior lints will remain, and they will quickly fall out of sync
@@ -819,6 +814,22 @@ impl Backend {
             .await;
     }
 
+    async fn refresh_misspelled_words_cache(&self, uri: &Uri) {
+        let diagnostics = self.generate_diagnostics(uri).await;
+
+        let mut doc_states = self.doc_state.lock().await;
+        let Some(doc_state) = doc_states.get_mut(uri) else {
+            return;
+        };
+
+        let source = doc_state.document.get_source();
+        doc_state.misspelled_words = Arc::new(extract_misspelled_words(
+            source,
+            &doc_state.line_index,
+            &diagnostics,
+        ));
+    }
+
     async fn wait_for_in_flight_change(&self, uri: &Uri) {
         // Wait for currently running didChange processing to finish.
         // Wakeups are notify-driven (no fixed sleep), with a timeout as fallback.
@@ -867,7 +878,7 @@ impl Backend {
 
             (
                 doc_source.iter().copied().collect::<Vec<char>>(),
-                doc_state.dict.clone(),
+                doc_state.completion_dict.clone(),
                 doc_state.line_index.clone(),
                 doc_state.misspelled_words.clone(),
             )
@@ -1254,9 +1265,26 @@ impl LanguageServer for Backend {
             pending.insert(uri.clone(), now);
         }
 
-        // Debounce: wait 300ms before publishing diagnostics
-        // This prevents excessive diagnostic updates while typing
-        sleep(Duration::from_millis(300)).await;
+        // Refresh misspelled-word filtering sooner than full diagnostics publish.
+        sleep(Duration::from_millis(MISSPELLED_REFRESH_DEBOUNCE_MS)).await;
+
+        let should_refresh_misspellings = {
+            let pending = self.pending_changes.read().await;
+            pending.get(&uri).is_some_and(|&timestamp| timestamp == now)
+        };
+
+        if should_refresh_misspellings {
+            self.refresh_misspelled_words_cache(&uri).await;
+        } else {
+            // A newer change came in, skip this refresh cycle.
+            return;
+        }
+
+        let publish_wait_ms =
+            DIAGNOSTICS_PUBLISH_DEBOUNCE_MS.saturating_sub(MISSPELLED_REFRESH_DEBOUNCE_MS);
+        if publish_wait_ms > 0 {
+            sleep(Duration::from_millis(publish_wait_ms)).await;
+        }
 
         // Check if this is still the latest change for this URI
         let should_process = {
@@ -1502,7 +1530,7 @@ impl LanguageServer for Backend {
 
             for doc in doc_lock.values_mut() {
                 info!("Constructing new LintGroup for updated configuration.");
-                doc.linter = LintGroup::new_curated(doc.dict.clone(), config_lock.dialect)
+                doc.linter = LintGroup::new_curated(doc.lint_dict.clone(), config_lock.dialect)
                     .with_lint_config(config_lock.lint_config.clone());
             }
 

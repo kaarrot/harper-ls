@@ -13,7 +13,8 @@ use tower_lsp_server::lsp_types::{CodeActionOrCommand, Command, Diagnostic, Rang
 pub struct DocumentState {
     pub document: Document,
     pub ident_dict: Lrc<MutableDictionary>,
-    pub dict: Lrc<MergedDictionary>,
+    pub completion_dict: Lrc<MergedDictionary>,
+    pub lint_dict: Lrc<MergedDictionary>,
     pub linter: LintGroup,
     pub language_id: Option<String>,
     pub ignored_lints: IgnoredLints,
@@ -104,7 +105,8 @@ impl Default for DocumentState {
         Self {
             document: Default::default(),
             ident_dict: Default::default(),
-            dict: Default::default(),
+            completion_dict: Default::default(),
+            lint_dict: Default::default(),
             linter: Default::default(),
             language_id: Default::default(),
             ignored_lints: Default::default(),
