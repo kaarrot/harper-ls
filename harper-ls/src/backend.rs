@@ -280,6 +280,58 @@ fn calculate_char_frequency_similarity(a: &[char], b: &[char]) -> f32 {
     1.0 - (diff_sum as f32 / max_diff).min(1.0)
 }
 
+/// Apply casing intent from the typed prefix to a completion candidate.
+///
+/// Behavior:
+/// - All-uppercase prefix with at least 2 letters => uppercase completion.
+/// - First-letter uppercase prefix => title-case completion for normal words.
+/// - Preserve mixed-case words that start lowercase with internal capitals
+///   (e.g. "iPhone", "eBay") when prefix is first-letter uppercase.
+/// - Otherwise keep original completion casing.
+fn apply_prefix_casing(prefix: &[char], word: &str) -> String {
+    if prefix.is_empty() {
+        return word.to_string();
+    }
+
+    let word_chars: Vec<char> = word.chars().collect();
+    if word_chars.is_empty() {
+        return word.to_string();
+    }
+
+    let first_is_upper = prefix[0].is_uppercase();
+    let all_upper = prefix
+        .iter()
+        .all(|c| !c.is_alphabetic() || c.is_uppercase());
+    let alphabetic_count = prefix.iter().filter(|c| c.is_alphabetic()).count();
+
+    // Only treat as CAPS intent when there are 2+ alphabetic characters.
+    if all_upper && alphabetic_count >= 2 {
+        return word.to_uppercase();
+    }
+
+    if first_is_upper {
+        let has_internal_upper = word_chars.iter().skip(1).any(|c| c.is_uppercase());
+        let starts_lowercase = word_chars[0].is_lowercase();
+
+        // Preserve branded/mixed-case forms like iPhone and eBay.
+        if starts_lowercase && has_internal_upper {
+            return word.to_string();
+        }
+
+        let mut result = String::new();
+        for (i, ch) in word_chars.iter().enumerate() {
+            if i == 0 {
+                result.push(ch.to_uppercase().next().unwrap_or(*ch));
+            } else {
+                result.push(*ch);
+            }
+        }
+        return result;
+    }
+
+    word.to_string()
+}
+
 fn extract_misspelled_words(
     source: &[char],
     line_index: &crate::pos_conv::LineIndex,
@@ -979,43 +1031,6 @@ impl Backend {
         // Convert prefix to string - we'll use this as filterText
         // This tells Helix that all our completions match the user's input
         let prefix_string: String = prefix.iter().collect();
-
-        // Helper function to apply smart casing based on user's input pattern
-        // Preserves dictionary word casing while respecting user's capitalization intent
-        let apply_prefix_casing = |prefix: &[char], word: &str| -> String {
-            if prefix.is_empty() {
-                return word.to_string();
-            }
-
-            let word_chars: Vec<char> = word.chars().collect();
-
-            // Check the casing pattern of the prefix
-            let first_is_upper = prefix[0].is_uppercase();
-            let all_upper = prefix
-                .iter()
-                .all(|c| !c.is_alphabetic() || c.is_uppercase());
-
-            // If all typed characters are uppercase, return all uppercase
-            if all_upper && prefix.iter().any(|c| c.is_alphabetic()) {
-                return word.to_uppercase();
-            }
-
-            // If only first character is uppercase, capitalize first letter of word
-            if first_is_upper {
-                let mut result = String::new();
-                for (i, ch) in word_chars.iter().enumerate() {
-                    if i == 0 {
-                        result.push(ch.to_uppercase().next().unwrap_or(*ch));
-                    } else {
-                        result.push(*ch);
-                    }
-                }
-                return result;
-            }
-
-            // Otherwise (all lowercase or mixed), keep original word casing
-            word.to_string()
-        };
 
         // Convert to LSP completion items
         // Use text_edit to specify exact replacement range - this tells Helix what to replace
@@ -1917,5 +1932,23 @@ mod completion_scoring_tests {
             score_len_plus_3,
             score_len_plus_6
         );
+    }
+
+    #[test]
+    fn test_apply_prefix_casing_preserves_mixed_case_words() {
+        let prefix = chars("Ip");
+        assert_eq!(apply_prefix_casing(&prefix, "iPhone"), "iPhone");
+
+        let prefix2 = chars("Eb");
+        assert_eq!(apply_prefix_casing(&prefix2, "eBay"), "eBay");
+    }
+
+    #[test]
+    fn test_apply_prefix_casing_caps_intent_requires_two_letters() {
+        let one_letter_caps = chars("I");
+        assert_eq!(apply_prefix_casing(&one_letter_caps, "iphone"), "Iphone");
+
+        let two_letter_caps = chars("IP");
+        assert_eq!(apply_prefix_casing(&two_letter_caps, "iphone"), "IPHONE");
     }
 }
