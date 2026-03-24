@@ -21,7 +21,7 @@ use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
 };
 use harper_core::spell::{Dictionary, FstDictionary, MergedDictionary, MutableDictionary};
-use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints};
+use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints, TokenKind};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
 use harper_jjdescription::JJDescriptionParser;
@@ -808,23 +808,37 @@ impl Backend {
         }
 
         // Copy needed data while holding lock, then release it before expensive operations.
-        let (source, dict, line_index, misspelled_words) = {
+        let (source, dict, line_index, misspelled_words, cursor_index) = {
             let doc_states = self.doc_state.lock().await;
             let Some(doc_state) = doc_states.get(uri) else {
                 return Ok(Vec::new());
             };
             let doc_source = doc_state.document.get_source();
+            let source: Vec<char> = doc_source.iter().copied().collect();
+
+            // Convert LSP position to character index while holding the lock so we can
+            // check the token kind before releasing it.
+            let cursor_index = doc_state.line_index.position_to_index(&source, position);
+
+            // Only complete inside lintable regions (comments/docstrings).
+            // Code regions are marked Unlintable by the language parser — skip them.
+            // If no token exists at the cursor (e.g. empty file), also skip.
+            let in_lintable_region = doc_state
+                .document
+                .get_token_at_char_index(cursor_index)
+                .is_some_and(|t| !matches!(t.kind, TokenKind::Unlintable));
+            if !in_lintable_region {
+                return Ok(Vec::new());
+            }
 
             (
-                doc_source.iter().copied().collect::<Vec<char>>(),
+                source,
                 doc_state.completion_dict.clone(),
                 doc_state.line_index.clone(),
                 doc_state.misspelled_words.clone(),
+                cursor_index,
             )
         }; // Lock released here
-
-        // Convert LSP position to character index using line index (O(1) instead of O(N))
-        let cursor_index = line_index.position_to_index(&source, position);
 
         // Find the word being typed by looking backwards from cursor
         let word_start = source[..cursor_index]
