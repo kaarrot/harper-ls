@@ -250,6 +250,28 @@ fn extract_misspelled_words(
         .collect()
 }
 
+fn is_completion_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '\'' || c == '-'
+}
+
+fn find_completion_word_bounds(source: &[char], cursor_index: usize) -> (usize, usize) {
+    let cursor_index = cursor_index.min(source.len());
+
+    let word_start = source[..cursor_index]
+        .iter()
+        .rposition(|c| !is_completion_word_char(*c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let suffix_len = source[cursor_index..]
+        .iter()
+        .position(|c| !is_completion_word_char(*c))
+        .unwrap_or(source.len() - cursor_index);
+    let word_end = cursor_index + suffix_len;
+
+    (word_start, word_end)
+}
+
 impl Backend {
     pub fn new(client: Client, config: Config) -> Self {
         Self {
@@ -840,12 +862,8 @@ impl Backend {
             )
         }; // Lock released here
 
-        // Find the word being typed by looking backwards from cursor
-        let word_start = source[..cursor_index]
-            .iter()
-            .rposition(|c| !c.is_alphanumeric() && *c != '\'' && *c != '-')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        // Find full word bounds around cursor so completion replaces both prefix and suffix.
+        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
 
         // Extract the prefix being typed
         let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
@@ -896,7 +914,7 @@ impl Backend {
 
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(&source, word_start);
-        let cursor_position = line_index.index_to_position(&source, cursor_index);
+        let word_end_position = line_index.index_to_position(&source, word_end);
 
         // Convert prefix to string - we'll use this as filterText
         // This tells Helix that all our completions match the user's input
@@ -919,11 +937,11 @@ impl Backend {
                     label: word_string.clone(),
                     kind: Some(CompletionItemKind::TEXT),
                     detail: Some("Harper".to_string()),
-                    // text_edit specifies the exact range to replace
+                    // Replace the full word under/around cursor.
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: Range {
                             start: word_start_position,
-                            end: cursor_position,
+                            end: word_end_position,
                         },
                         new_text: completion_text,
                     })),
@@ -1508,6 +1526,46 @@ mod completion_ranking_tests {
             edit_distance,
             is_common,
         )
+    }
+
+    #[test]
+    fn test_completion_word_bounds_include_suffix_after_cursor() {
+        let source = chars("hello worlxd!");
+        let cursor_index = "hello wo".chars().count();
+
+        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+
+        assert_eq!(word_start, 6);
+        assert_eq!(word_end, 12);
+    }
+
+    #[test]
+    fn test_completion_word_bounds_at_word_end() {
+        let source = chars("hello wo!");
+        let cursor_index = "hello wo".chars().count();
+
+        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+
+        assert_eq!(word_start, 6);
+        assert_eq!(word_end, 8);
+    }
+
+    #[test]
+    fn test_completion_word_bounds_include_apostrophe_and_dash() {
+        let source = chars("it's re-entering.");
+        let cursor_index = "it's re".chars().count();
+
+        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+
+        assert_eq!(word_start, 5);
+        assert_eq!(word_end, 16);
+    }
+
+    #[test]
+    fn test_ths_completion_ordering() {
+        // When typing "ths", "the" and "this" should rank higher than "tab", "tag"
+        assert_better("ths", ("the", 1, true), ("tab", 2, true), "the should rank better than tab for query ths");
+        assert_better("ths", ("this", 1, true), ("tag", 2, true), "this should rank better than tag for query ths");
     }
 
     fn assert_better(query: &str, better: (&str, u8, bool), worse: (&str, u8, bool), reason: &str) {
