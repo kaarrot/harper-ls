@@ -55,7 +55,7 @@ impl LineIndex {
     }
 
     /// Convert an LSP Position to a character index.
-    /// O(1) complexity using direct array access.
+    /// O(line length) complexity after O(1) line lookup.
     pub fn position_to_index(&self, source: &[char], position: Position) -> usize {
         // Find target line start index
         let line_idx = position.line as usize;
@@ -73,17 +73,7 @@ impl LineIndex {
             .copied()
             .unwrap_or(source.len());
 
-        let target_line = &source[line_start..line_end];
-
-        // Find character at requested column (handling UTF-16 encoding)
-        let target_char_idx = position.character as usize;
-
-        if target_char_idx > target_line.len() {
-            // Column is past end of line - clamp to end
-            return line_end;
-        }
-
-        line_start + target_char_idx
+        position_to_index_in_line(source, line_start, line_end, position.character)
     }
 
     /// Convert a Span to an LSP Range using this line index.
@@ -118,23 +108,58 @@ impl LineIndex {
                 .copied()
                 .unwrap_or(source.len());
 
-            // Calculate line length for LSP purposes (excluding trailing newline)
-            // LSP character positions don't count the newline terminator
-            let raw_line_len = line_end - line_start;
-            let line_len = if raw_line_len > 0 && source.get(line_end - 1) == Some(&'\n') {
-                raw_line_len - 1
-            } else {
-                raw_line_len
-            };
+            let content_end = line_content_end(source, line_start, line_end);
+            let line_len_utf16: usize = source[line_start..content_end]
+                .iter()
+                .map(|c| c.len_utf16())
+                .sum();
 
-            // Position is out of bounds if character is beyond line content length
-            // Use >= because character N means "after N characters", so for a line
-            // with N characters, position N is at the end (valid), N+1 is out of bounds
-            position.character as usize > line_len
+            // Position is out of bounds if character is beyond line content length.
+            // Character N means "after N UTF-16 code units", so for a line with N
+            // code units, position N is at the end and still valid.
+            position.character as usize > line_len_utf16
         } else {
             // Line doesn't exist - definitely out of bounds
             true
         }
+    }
+}
+
+fn line_content_end(source: &[char], line_start: usize, line_end: usize) -> usize {
+    if line_end > line_start && source.get(line_end - 1) == Some(&'\n') {
+        line_end - 1
+    } else {
+        line_end
+    }
+}
+
+fn position_to_index_in_line(
+    source: &[char],
+    line_start: usize,
+    line_end: usize,
+    utf16_character: u32,
+) -> usize {
+    let content_end = line_content_end(source, line_start, line_end);
+    let target_utf16 = utf16_character as usize;
+    let mut seen_utf16 = 0;
+
+    for (offset, ch) in source[line_start..content_end].iter().enumerate() {
+        if seen_utf16 == target_utf16 {
+            return line_start + offset;
+        }
+
+        let next_seen_utf16 = seen_utf16 + ch.len_utf16();
+        if target_utf16 < next_seen_utf16 {
+            return line_start + offset;
+        }
+
+        seen_utf16 = next_seen_utf16;
+    }
+
+    if target_utf16 <= seen_utf16 {
+        content_end
+    } else {
+        line_end.saturating_sub(1)
     }
 }
 
@@ -174,40 +199,33 @@ fn index_to_position(source: &[char], index: usize) -> Position {
 /// is too high, the index of the last character in the source is returned. If the line is
 /// in-bounds but the requested character isn't, the last character of that line is returned.
 pub fn position_to_index(source: &[char], position: Position) -> usize {
-    // Find target line.
-    let Some(target_line) = source
-        // Split including the newline character so we don't lose any characters.
-        .split_inclusive(|char| *char == '\n')
-        .nth(position.line as usize)
-    else {
+    let mut line_start = 0;
+    for _ in 0..position.line {
+        let Some(newline_offset) = source[line_start..].iter().position(|char| *char == '\n')
+        else {
+            // Requested line index is too high.
+            // Return the last char in `source' as the closest approximation.
+            // Uses `saturating_sub` to avoid underflow when `source` is empty.
+            return source.len().saturating_sub(1);
+        };
+
+        line_start += newline_offset + 1;
+    }
+
+    if line_start > source.len() {
         // Requested line index is too high.
         // Return the last char in `source' as the closest approximation.
         // Uses `saturating_sub` to avoid underflow when `source` is empty.
         return source.len().saturating_sub(1);
-    };
+    }
 
-    // Get a pointer to the char we seek.
-    // Check if specified character index is within bounds of the target line.
-    let target_char_pointer = if position.character
-        < target_line
-            .len()
-            .try_into()
-            .expect("target_line.len() can fit in u32")
-    {
-        // Character index is inside the bounds of the specified line.
-        // Calculate pointer to the char we're looking for.
-        target_line
-            .as_ptr()
-            .wrapping_add(position.character as usize)
-    } else {
-        // Character index is outside the bounds of the specified line.
-        // Get pointer to the last character of the line.
-        target_line.last().expect("line cannot be empty")
-    };
+    let line_end = source[line_start..]
+        .iter()
+        .position(|char| *char == '\n')
+        .map(|newline_offset| line_start + newline_offset + 1)
+        .unwrap_or(source.len());
 
-    // Convert the char pointer to its index within `source`.
-    // Note: this could be simplified with `offset_from`, but that would require `unsafe`.
-    (target_char_pointer as usize - source.as_ptr() as usize) / size_of::<char>()
+    position_to_index_in_line(source, line_start, line_end, position.character)
 }
 
 pub fn range_to_span(source: &[char], range: Range) -> Span<char> {
@@ -221,7 +239,7 @@ pub fn range_to_span(source: &[char], range: Range) -> Span<char> {
 mod tests {
     use tower_lsp_server::lsp_types::{Position, Range};
 
-    use super::{index_to_position, position_to_index, range_to_span};
+    use super::{LineIndex, index_to_position, position_to_index, range_to_span};
 
     #[test]
     fn first_line_correct() {
@@ -390,5 +408,46 @@ mod tests {
 
         let out_index = position_to_index(&source, position);
         assert_eq!(source[out_index], 'l');
+    }
+
+    #[test]
+    fn line_index_position_to_index_uses_utf16_columns() {
+        let source: Vec<_> = "😀 pred".chars().collect();
+        let line_index = LineIndex::new(&source);
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
+
+        let out_index = line_index.position_to_index(&source, position);
+
+        assert_eq!(out_index, source.len());
+    }
+
+    #[test]
+    fn line_index_position_after_non_bmp_character() {
+        let source: Vec<_> = "a😀b".chars().collect();
+        let line_index = LineIndex::new(&source);
+        let position = Position {
+            line: 0,
+            character: 3,
+        };
+
+        let out_index = line_index.position_to_index(&source, position);
+
+        assert_eq!(source[out_index], 'b');
+    }
+
+    #[test]
+    fn position_to_index_uses_utf16_columns() {
+        let source: Vec<_> = "a😀b".chars().collect();
+        let position = Position {
+            line: 0,
+            character: 3,
+        };
+
+        let out_index = position_to_index(&source, position);
+
+        assert_eq!(source[out_index], 'b');
     }
 }

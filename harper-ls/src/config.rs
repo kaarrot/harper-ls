@@ -71,6 +71,36 @@ pub struct CompletionConfig {
     pub min_prefix_length: usize,
     /// Maximum number of completion results to return
     pub max_results: usize,
+    /// Whether space should accept completion items.
+    pub commit_with_space: CompletionCommitWithSpace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionCommitWithSpace {
+    Never,
+    Confident,
+    Always,
+}
+
+impl Default for CompletionCommitWithSpace {
+    fn default() -> Self {
+        Self::Confident
+    }
+}
+
+impl CompletionCommitWithSpace {
+    fn from_lsp_config(value: &Value) -> Result<Self> {
+        let Value::String(value) = value else {
+            bail!("commitWithSpace must be one of: \"never\", \"confident\", or \"always\".");
+        };
+
+        match value.as_str() {
+            "never" => Ok(Self::Never),
+            "confident" => Ok(Self::Confident),
+            "always" => Ok(Self::Always),
+            _ => bail!("commitWithSpace must be one of: \"never\", \"confident\", or \"always\"."),
+        }
+    }
 }
 
 impl Default for CompletionConfig {
@@ -78,7 +108,8 @@ impl Default for CompletionConfig {
         Self {
             enabled: true,
             min_prefix_length: 2,
-            max_results: 50,
+            max_results: 7,
+            commit_with_space: CompletionCommitWithSpace::default(),
         }
     }
 }
@@ -114,6 +145,11 @@ impl CompletionConfig {
             if let Some(val) = max_results.as_u64() {
                 base.max_results = val as usize;
             }
+        }
+
+        if let Some(commit_with_space_val) = value.get("commitWithSpace") {
+            base.commit_with_space =
+                CompletionCommitWithSpace::from_lsp_config(commit_with_space_val)?;
         }
 
         Ok(base)
@@ -291,5 +327,56 @@ impl Default for Config {
             max_file_length: 120_000,
             exclude_patterns: GlobSet::empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{CompletionCommitWithSpace, CompletionConfig};
+
+    #[test]
+    fn completion_commit_with_space_defaults_to_confident() {
+        let config = CompletionConfig::from_lsp_config(json!({})).unwrap();
+
+        assert_eq!(
+            config.commit_with_space,
+            CompletionCommitWithSpace::Confident
+        );
+        assert_eq!(config.max_results, 7);
+    }
+
+    #[test]
+    fn completion_commit_with_space_parses_valid_modes() {
+        let never = CompletionConfig::from_lsp_config(json!({
+            "commitWithSpace": "never"
+        }))
+        .unwrap();
+        let confident = CompletionConfig::from_lsp_config(json!({
+            "commitWithSpace": "confident"
+        }))
+        .unwrap();
+        let always = CompletionConfig::from_lsp_config(json!({
+            "commitWithSpace": "always"
+        }))
+        .unwrap();
+
+        assert_eq!(never.commit_with_space, CompletionCommitWithSpace::Never);
+        assert_eq!(
+            confident.commit_with_space,
+            CompletionCommitWithSpace::Confident
+        );
+        assert_eq!(always.commit_with_space, CompletionCommitWithSpace::Always);
+    }
+
+    #[test]
+    fn completion_commit_with_space_rejects_invalid_modes() {
+        assert!(
+            CompletionConfig::from_lsp_config(json!({
+                "commitWithSpace": "sometimes"
+            }))
+            .is_err()
+        );
     }
 }

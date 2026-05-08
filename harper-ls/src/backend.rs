@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::config::Config;
+use crate::config::{CompletionCommitWithSpace, Config};
 use crate::dictionary_io::{load_dict, save_dict};
 use crate::document_state::DocumentState;
 use crate::git_commit_parser::GitCommitParser;
@@ -15,7 +15,9 @@ use crate::io_utils::fileify_path;
 use anyhow::{Context, Result, anyhow};
 use futures::future::join;
 use harper_comments::CommentParser;
-use harper_core::keyboard_distance::avg_keyboard_distance;
+use harper_core::keyboard_distance::{
+    INSERT_DELETE_COST, keyboard_substitution_cost, weighted_damerau_distance,
+};
 use harper_core::linting::{LintGroup, LintGroupConfig};
 use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
@@ -83,88 +85,355 @@ pub struct Backend {
 
 #[derive(Debug, Clone)]
 struct CompletionSortRank {
-    edit_distance: u8,
+    distance: u16,
+    exact_prefix: bool,
+    typed_word: bool,
+    high_confidence_short_correction: bool,
     first_letter_match: bool,
-    prefix_match_len: usize,
-    is_transposition: bool,
     is_common: bool,
-    avg_kbd_distance: f32,
-    len_diff: usize,
+    local_frequency: usize,
+    previous_word_frequency: usize,
+    remaining_ambiguity: usize,
+    replacement_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionPrefixScore {
+    distance: u16,
+    exact_prefix: bool,
+    matched_prefix_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RankedCompletion {
+    word: String,
+    rank: CompletionSortRank,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CompletionContext {
+    local_word_counts: HashMap<String, usize>,
+    previous_word_counts: HashMap<(String, String), usize>,
+    previous_word: Option<String>,
 }
 
 fn first_letter_matches(query: &[char], candidate: &[char]) -> bool {
     !query.is_empty() && !candidate.is_empty() && query[0].eq_ignore_ascii_case(&candidate[0])
 }
 
-fn common_prefix_len(query: &[char], candidate: &[char]) -> usize {
-    query
-        .iter()
-        .zip(candidate.iter())
-        .take_while(|(q, c)| q.eq_ignore_ascii_case(c))
-        .count()
+fn chars_equal_ignore_case(a: char, b: char) -> bool {
+    a.eq_ignore_ascii_case(&b)
 }
 
-fn is_simple_transposition(query: &[char], candidate: &[char]) -> bool {
-    if query.len() != candidate.len() {
+fn starts_with_ignore_case(candidate: &[char], prefix: &[char]) -> bool {
+    candidate.len() >= prefix.len()
+        && candidate
+            .iter()
+            .zip(prefix.iter())
+            .all(|(candidate_char, prefix_char)| {
+                chars_equal_ignore_case(*candidate_char, *prefix_char)
+            })
+}
+
+fn same_word_ignore_case(a: &[char], b: &[char]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(a_char, b_char)| chars_equal_ignore_case(*a_char, *b_char))
+}
+
+fn allowed_noisy_prefix_edits(prefix_len: usize) -> usize {
+    match prefix_len {
+        0..=2 => 1,
+        3..=5 => 2,
+        6..=9 => 3,
+        _ => 4,
+    }
+}
+
+fn max_noisy_prefix_distance(prefix_len: usize) -> u16 {
+    (allowed_noisy_prefix_edits(prefix_len) as u16).saturating_mul(INSERT_DELETE_COST)
+}
+
+fn exact_prefix_extension_penalty(query_len: usize, remaining_ambiguity: usize) -> u16 {
+    if remaining_ambiguity == 0 {
+        return 0;
+    }
+
+    let per_char = if query_len <= 3 { 20 } else { 5 };
+    (remaining_ambiguity as u16).saturating_mul(per_char)
+}
+
+fn best_completion_prefix_score(
+    query: &[char],
+    candidate: &[char],
+) -> Option<CompletionPrefixScore> {
+    if query.is_empty() || candidate.is_empty() {
+        return None;
+    }
+
+    if starts_with_ignore_case(candidate, query) {
+        let remaining_ambiguity = candidate.len().saturating_sub(query.len());
+        return Some(CompletionPrefixScore {
+            distance: exact_prefix_extension_penalty(query.len(), remaining_ambiguity),
+            exact_prefix: true,
+            matched_prefix_len: query.len(),
+        });
+    }
+
+    let allowed_edits = allowed_noisy_prefix_edits(query.len());
+    if candidate.len() + allowed_edits < query.len() {
+        return None;
+    }
+
+    let lower_prefix_len = query.len().saturating_sub(allowed_edits).max(1);
+    let upper_prefix_len = candidate.len().min(query.len() + allowed_edits);
+
+    if lower_prefix_len > upper_prefix_len {
+        return None;
+    }
+
+    let max_distance = max_noisy_prefix_distance(query.len());
+
+    (lower_prefix_len..=upper_prefix_len)
+        .map(|prefix_len| CompletionPrefixScore {
+            distance: weighted_damerau_distance(query, &candidate[..prefix_len]),
+            exact_prefix: false,
+            matched_prefix_len: prefix_len,
+        })
+        .filter(|score| score.distance <= max_distance)
+        .min_by(|a, b| {
+            a.distance
+                .cmp(&b.distance)
+                .then_with(|| b.matched_prefix_len.cmp(&a.matched_prefix_len))
+        })
+}
+
+fn should_score_noisy_prefix_candidate(query: &[char], candidate: &[char]) -> bool {
+    if query.is_empty() || candidate.is_empty() {
         return false;
     }
 
-    let mut diff_positions = Vec::new();
-    for (i, (q, c)) in query.iter().zip(candidate.iter()).enumerate() {
-        if !q.eq_ignore_ascii_case(c) {
-            diff_positions.push(i);
-            if diff_positions.len() > 2 {
-                return false;
-            }
-        }
+    if chars_equal_ignore_case(query[0], candidate[0])
+        || keyboard_substitution_cost(query[0], candidate[0]) <= INSERT_DELETE_COST
+    {
+        return true;
     }
 
-    if diff_positions.len() != 2 {
-        return false;
+    if query.len() > 1 && chars_equal_ignore_case(query[1], candidate[0]) {
+        return true;
     }
 
-    let i = diff_positions[0];
-    let j = diff_positions[1];
-    j == i + 1
-        && query[i].eq_ignore_ascii_case(&candidate[j])
-        && query[j].eq_ignore_ascii_case(&candidate[i])
+    candidate.len() > 1 && chars_equal_ignore_case(query[0], candidate[1])
+}
+
+fn normalized_completion_word(chars: &[char]) -> String {
+    chars.iter().collect::<String>().to_lowercase()
 }
 
 fn completion_sort_rank(
     query: &[char],
     candidate: &[char],
-    edit_distance: u8,
+    prefix_score: CompletionPrefixScore,
     is_common: bool,
+    context: &CompletionContext,
 ) -> CompletionSortRank {
+    let normalized_candidate = normalized_completion_word(candidate);
+    let previous_word_frequency = context
+        .previous_word
+        .as_ref()
+        .and_then(|previous_word| {
+            context
+                .previous_word_counts
+                .get(&(previous_word.clone(), normalized_candidate.clone()))
+        })
+        .copied()
+        .unwrap_or(0);
+
     CompletionSortRank {
-        edit_distance,
+        distance: prefix_score.distance,
+        exact_prefix: prefix_score.exact_prefix,
+        typed_word: same_word_ignore_case(query, candidate),
+        high_confidence_short_correction: query.len() <= 3
+            && candidate.len() == query.len()
+            && !prefix_score.exact_prefix
+            && prefix_score.distance <= INSERT_DELETE_COST
+            && is_common,
         first_letter_match: first_letter_matches(query, candidate),
-        prefix_match_len: common_prefix_len(query, candidate),
-        is_transposition: is_simple_transposition(query, candidate),
-        // frequency proxy (best currently available metadata signal)
         is_common,
-        avg_kbd_distance: if edit_distance > 0 {
-            avg_keyboard_distance(query, candidate)
-        } else {
-            0.0
-        },
-        len_diff: candidate.len().abs_diff(query.len()),
+        local_frequency: context
+            .local_word_counts
+            .get(&normalized_candidate)
+            .copied()
+            .unwrap_or(0),
+        previous_word_frequency,
+        remaining_ambiguity: candidate
+            .len()
+            .saturating_sub(prefix_score.matched_prefix_len),
+        replacement_len: candidate.len(),
     }
 }
 
 fn compare_completion_ranks(a: &CompletionSortRank, b: &CompletionSortRank) -> Ordering {
-    a.edit_distance
-        .cmp(&b.edit_distance)
-        .then_with(|| b.first_letter_match.cmp(&a.first_letter_match))
-        .then_with(|| b.prefix_match_len.cmp(&a.prefix_match_len))
-        .then_with(|| b.is_transposition.cmp(&a.is_transposition))
-        .then_with(|| b.is_common.cmp(&a.is_common))
+    b.typed_word
+        .cmp(&a.typed_word)
         .then_with(|| {
-            a.avg_kbd_distance
-                .partial_cmp(&b.avg_kbd_distance)
-                .unwrap_or(Ordering::Equal)
+            b.high_confidence_short_correction
+                .cmp(&a.high_confidence_short_correction)
         })
-        .then_with(|| a.len_diff.cmp(&b.len_diff))
+        .then_with(|| a.distance.cmp(&b.distance))
+        .then_with(|| b.exact_prefix.cmp(&a.exact_prefix))
+        .then_with(|| b.first_letter_match.cmp(&a.first_letter_match))
+        .then_with(|| b.is_common.cmp(&a.is_common))
+        .then_with(|| b.local_frequency.cmp(&a.local_frequency))
+        .then_with(|| b.previous_word_frequency.cmp(&a.previous_word_frequency))
+        .then_with(|| a.remaining_ambiguity.cmp(&b.remaining_ambiguity))
+        .then_with(|| a.replacement_len.cmp(&b.replacement_len))
+}
+
+fn build_completion_context(
+    source: &[char],
+    document: &Document,
+    current_word_start: usize,
+    current_word_end: usize,
+) -> CompletionContext {
+    let mut context = CompletionContext::default();
+    let mut previous_non_current_word: Option<String> = None;
+
+    for token in document.tokens() {
+        if !token.kind.is_word() {
+            continue;
+        }
+
+        let normalized_word = normalized_completion_word(token.span.get_content(source));
+        if token.span.end <= current_word_start {
+            context.previous_word = Some(normalized_word.clone());
+        }
+
+        let overlaps_current_word =
+            token.span.start < current_word_end && current_word_start < token.span.end;
+        if overlaps_current_word {
+            previous_non_current_word = None;
+            continue;
+        }
+
+        *context
+            .local_word_counts
+            .entry(normalized_word.clone())
+            .or_default() += 1;
+
+        if let Some(previous_word) = &previous_non_current_word {
+            *context
+                .previous_word_counts
+                .entry((previous_word.clone(), normalized_word.clone()))
+                .or_default() += 1;
+        }
+
+        previous_non_current_word = Some(normalized_word);
+    }
+
+    context
+}
+
+fn rank_completion_candidates(
+    dict: &dyn Dictionary,
+    prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    max_results: usize,
+) -> Vec<RankedCompletion> {
+    if max_results == 0 {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut completions = Vec::new();
+
+    for word in dict.words_iter() {
+        if !starts_with_ignore_case(word, prefix)
+            && !should_score_noisy_prefix_candidate(prefix, word)
+        {
+            continue;
+        }
+
+        let normalized_word = normalized_completion_word(word);
+        if !seen.insert(normalized_word.clone()) {
+            continue;
+        }
+
+        if misspelled_words.contains(&normalized_word) {
+            continue;
+        }
+
+        let Some(prefix_score) = best_completion_prefix_score(prefix, word) else {
+            continue;
+        };
+
+        let is_common = dict
+            .get_word_metadata(word)
+            .is_some_and(|metadata| metadata.common);
+        let rank = completion_sort_rank(prefix, word, prefix_score, is_common, context);
+
+        insert_ranked_completion(
+            &mut completions,
+            RankedCompletion {
+                word: word.iter().collect(),
+                rank,
+            },
+            max_results,
+        );
+    }
+
+    completions
+}
+
+fn compare_ranked_completion(a: &RankedCompletion, b: &RankedCompletion) -> Ordering {
+    compare_completion_ranks(&a.rank, &b.rank).then_with(|| a.word.cmp(&b.word))
+}
+
+fn insert_ranked_completion(
+    completions: &mut Vec<RankedCompletion>,
+    completion: RankedCompletion,
+    max_results: usize,
+) {
+    let insert_at = completions
+        .binary_search_by(|existing| compare_ranked_completion(existing, &completion))
+        .unwrap_or_else(|idx| idx);
+
+    if insert_at >= max_results {
+        return;
+    }
+
+    completions.insert(insert_at, completion);
+    completions.truncate(max_results);
+}
+
+fn should_commit_space(completions: &[RankedCompletion]) -> bool {
+    let Some(top) = completions.first() else {
+        return false;
+    };
+
+    if top.rank.typed_word || top.rank.distance > INSERT_DELETE_COST {
+        return false;
+    }
+
+    let Some(runner_up) = completions.get(1) else {
+        return true;
+    };
+
+    top.rank.distance.saturating_add(INSERT_DELETE_COST / 2) < runner_up.rank.distance
+}
+
+fn should_item_commit_space(
+    item_index: usize,
+    completions: &[RankedCompletion],
+    commit_with_space: CompletionCommitWithSpace,
+) -> bool {
+    match commit_with_space {
+        CompletionCommitWithSpace::Never => false,
+        CompletionCommitWithSpace::Confident => item_index == 0 && should_commit_space(completions),
+        CompletionCommitWithSpace::Always => item_index < completions.len(),
+    }
 }
 
 /// Apply casing intent from the typed prefix to a completion candidate.
@@ -830,7 +1099,7 @@ impl Backend {
         }
 
         // Copy needed data while holding lock, then release it before expensive operations.
-        let (source, dict, line_index, misspelled_words, cursor_index) = {
+        let (source, dict, line_index, misspelled_words, word_start, word_end, prefix, context) = {
             let doc_states = self.doc_state.lock().await;
             let Some(doc_state) = doc_states.get(uri) else {
                 return Ok(Vec::new());
@@ -845,72 +1114,57 @@ impl Backend {
             // Only complete inside lintable regions (comments/docstrings).
             // Code regions are marked Unlintable by the language parser — skip them.
             // If no token exists at the cursor (e.g. empty file), also skip.
-            let in_lintable_region = doc_state
-                .document
-                .get_token_at_char_index(cursor_index)
-                .is_some_and(|t| !matches!(t.kind, TokenKind::Unlintable));
+            let token_check_index = cursor_index.min(source.len().saturating_sub(1));
+            let in_lintable_region = !source.is_empty()
+                && doc_state
+                    .document
+                    .get_token_at_char_index(token_check_index)
+                    .is_some_and(|t| !matches!(t.kind, TokenKind::Unlintable));
             if !in_lintable_region {
                 return Ok(Vec::new());
             }
+
+            let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+            let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
+            let context =
+                build_completion_context(&source, &doc_state.document, word_start, word_end);
 
             (
                 source,
                 doc_state.completion_dict.clone(),
                 doc_state.line_index.clone(),
                 doc_state.misspelled_words.clone(),
-                cursor_index,
+                word_start,
+                word_end,
+                prefix,
+                context,
             )
         }; // Lock released here
-
-        // Find full word bounds around cursor so completion replaces both prefix and suffix.
-        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
-
-        // Extract the prefix being typed
-        let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
 
         // Don't show completions for very short prefixes
         if prefix.len() < completion_config.min_prefix_length {
             return Ok(Vec::new());
         }
 
-        // Perform expensive fuzzy matching and scoring WITHOUT holding the lock
-        // This is the same logic as generate_completion_list but without needing DocumentState
-        // Use adaptive edit distance based on prefix length for better matching on longer words
-        // Very short (2 chars): distance 1 - very strict to avoid noise
-        // Short words (3-5 chars): distance 2 - allow common typos like doubled letters (tthi→this)
-        // Medium words (6-9 chars): distance 3 - balanced
-        // Long words (10+ chars): distance 4 - accommodate multiple typos
-        let max_edit_distance = match prefix.len() {
-            0..=2 => 1,
-            3..=5 => 2,
-            6..=9 => 3,
-            _ => 4,
-        };
-        let fuzzy_completions = dict.fuzzy_match(&prefix, max_edit_distance, 200);
+        if completion_config.max_results == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut completions: Vec<(String, CompletionSortRank)> = fuzzy_completions
-            .into_iter()
-            .filter_map(|fuzzy_match| {
-                let word_string: String = fuzzy_match.word.iter().collect();
-
-                // Filter out words that are currently marked as misspelled in the document
-                // This prevents suggesting "tthis" when the user typed it earlier and it has an error
-                if misspelled_words.contains(&word_string.to_lowercase()) {
-                    return None;
-                }
-
-                let rank = completion_sort_rank(
-                    &prefix,
-                    fuzzy_match.word,
-                    fuzzy_match.edit_distance,
-                    fuzzy_match.metadata.common,
-                );
-                Some((word_string, rank))
-            })
-            .collect();
-
-        completions
-            .sort_by(|a, b| compare_completion_ranks(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
+        // Perform completion-specific prefix scoring without holding the document lock.
+        let ranking_limit = completion_config.max_results.max(2);
+        let completions = rank_completion_candidates(
+            dict.as_ref(),
+            &prefix,
+            &context,
+            misspelled_words.as_ref(),
+            ranking_limit,
+        );
+        let space_commit_flags: Vec<bool> =
+            (0..completion_config.max_results.min(completions.len()))
+                .map(|idx| {
+                    should_item_commit_space(idx, &completions, completion_config.commit_with_space)
+                })
+                .collect();
 
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(&source, word_start);
@@ -927,10 +1181,11 @@ impl Backend {
             .into_iter()
             .take(completion_config.max_results)
             .enumerate()
-            .map(|(idx, (word_string, _))| {
+            .map(|(idx, completion)| {
                 use tower_lsp_server::lsp_types::{CompletionTextEdit, Range, TextEdit};
 
                 // Apply the casing from the user's prefix to the completion
+                let word_string = completion.word;
                 let completion_text = apply_prefix_casing(&prefix, &word_string);
 
                 CompletionItem {
@@ -948,6 +1203,7 @@ impl Backend {
                     // filter_text must match what user typed for Helix to show the item
                     filter_text: Some(prefix_string.clone()),
                     sort_text: Some(format!("{:05}", idx)),
+                    commit_characters: space_commit_flags[idx].then(|| vec![" ".to_string()]),
                     ..Default::default()
                 }
             })
@@ -1023,8 +1279,7 @@ impl LanguageServer for Backend {
                             .map(String::from)
                             .collect(),
                     ),
-                    // Space auto-accepts first suggestion for natural spell-checker flow
-                    all_commit_characters: Some(vec![" ".to_string()]),
+                    all_commit_characters: None,
                     work_done_progress_options: Default::default(),
                     completion_item: None,
                 }),
@@ -1514,18 +1769,26 @@ mod completion_ranking_tests {
         s.chars().collect()
     }
 
-    fn rank(
+    fn dict_with_words(words: &[(&str, bool)]) -> MutableDictionary {
+        let mut dict = MutableDictionary::new();
+        for (word, common) in words {
+            let mut metadata = DictWordMetadata::default();
+            metadata.common = *common;
+            dict.append_word_str(word, metadata);
+        }
+        dict
+    }
+
+    fn ranked_words(
         query: &str,
-        candidate: &str,
-        edit_distance: u8,
-        is_common: bool,
-    ) -> CompletionSortRank {
-        completion_sort_rank(
-            chars(query).as_slice(),
-            chars(candidate).as_slice(),
-            edit_distance,
-            is_common,
-        )
+        dict: &dyn Dictionary,
+        context: &CompletionContext,
+    ) -> Vec<String> {
+        let misspelled_words = HashSet::new();
+        rank_completion_candidates(dict, &chars(query), context, &misspelled_words, 50)
+            .into_iter()
+            .map(|completion| completion.word)
+            .collect()
     }
 
     #[test]
@@ -1562,92 +1825,201 @@ mod completion_ranking_tests {
     }
 
     #[test]
-    fn test_ths_completion_ordering() {
-        // When typing "ths", "the" and "this" should rank higher than "tab", "tag"
-        assert_better("ths", ("the", 1, true), ("tab", 2, true), "the should rank better than tab for query ths");
-        assert_better("ths", ("this", 1, true), ("tag", 2, true), "this should rank better than tag for query ths");
-    }
+    fn pred_prefers_prefix_completions_over_short_fuzzy_words() {
+        let dict = dict_with_words(&[
+            ("prod", true),
+            ("predict", true),
+            ("prediction", true),
+            ("prey", true),
+        ]);
+        let words = ranked_words("pred", &dict, &CompletionContext::default());
 
-    fn assert_better(query: &str, better: (&str, u8, bool), worse: (&str, u8, bool), reason: &str) {
-        let better_rank = rank(query, better.0, better.1, better.2);
-        let worse_rank = rank(query, worse.0, worse.1, worse.2);
-
-        assert_eq!(
-            compare_completion_ranks(&better_rank, &worse_rank),
-            Ordering::Less,
-            "{}",
-            reason
+        assert_eq!(words[0], "predict");
+        assert_eq!(words[1], "prediction");
+        assert!(
+            words.iter().position(|word| word == "predict").unwrap()
+                < words.iter().position(|word| word == "prod").unwrap()
         );
     }
 
     #[test]
-    fn test_priority_edit_distance() {
-        assert_better(
-            "hello",
-            ("hello", 0, false),
-            ("hallo", 1, false),
-            "Lower edit distance must rank first",
+    fn ranking_limits_returned_candidates() {
+        let dict = dict_with_words(&[
+            ("abacus", true),
+            ("abandon", true),
+            ("abate", true),
+            ("abbey", true),
+        ]);
+        let misspelled_words = HashSet::new();
+        let completions = rank_completion_candidates(
+            &dict,
+            &chars("ab"),
+            &CompletionContext::default(),
+            &misspelled_words,
+            2,
         );
+
+        assert_eq!(completions.len(), 2);
     }
 
     #[test]
-    fn test_priority_first_letter_match() {
-        assert_better(
-            "test",
-            ("text", 1, false),
-            ("best", 1, false),
-            "First-letter match must beat mismatch when edit distance is tied",
-        );
+    fn transposed_teh_ranks_the_first() {
+        let dict = dict_with_words(&[
+            ("ten", true),
+            ("the", true),
+            ("tech", true),
+            ("Teheran", false),
+        ]);
+        let words = ranked_words("teh", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "the");
     }
 
     #[test]
-    fn test_priority_prefix_length() {
-        assert_better(
-            "ths",
-            ("this", 1, false),
-            ("tos", 1, false),
-            "Longer common prefix must rank first when higher priorities tie",
-        );
+    fn nearby_first_letter_typo_ranks_common_short_word_above_prefix_expansions() {
+        let dict = dict_with_words(&[
+            ("Rhea", false),
+            ("rheum", false),
+            ("rhetoric", false),
+            ("the", true),
+        ]);
+        let words = ranked_words("rhe", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "the");
     }
 
     #[test]
-    fn test_priority_transposition() {
-        assert_better(
-            "teh",
-            ("the", 1, false),
-            ("tah", 1, false),
-            "Transposition should beat non-transposition when higher priorities tie",
-        );
+    fn whie_ranks_while_first() {
+        let dict = dict_with_words(&[("white", true), ("while", true), ("whale", true)]);
+        let words = ranked_words("whie", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "while");
     }
 
     #[test]
-    fn test_tiebreak_common_word_proxy() {
-        assert_better(
-            "hel",
-            ("help", 1, true),
-            ("helm", 1, false),
-            "Common words (frequency proxy) should win tie-breaks",
-        );
+    fn rigth_ranks_right_first() {
+        let dict = dict_with_words(&[("rigid", true), ("right", true), ("righteous", true)]);
+        let words = ranked_words("rigth", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "right");
     }
 
     #[test]
-    fn test_tiebreak_keyboard_distance() {
-        assert_better(
-            "tge",
-            ("the", 1, false),
-            ("toe", 1, false),
-            "Lower keyboard distance should win tie-breaks",
-        );
+    fn nearby_key_typo_beats_distant_key_alternative() {
+        let dict = dict_with_words(&[("hello", false), ("pello", false)]);
+        let words = ranked_words("gello", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "hello");
     }
 
     #[test]
-    fn test_tiebreak_length_difference() {
-        assert_better(
-            "abc",
-            ("abx", 1, false),
-            ("abxy", 1, false),
-            "Smaller length difference should win final tie-break",
+    fn valid_typed_word_stays_on_top_and_does_not_commit_space() {
+        let dict = dict_with_words(&[("in", true), ("inn", true), ("inside", true)]);
+        let misspelled_words = HashSet::new();
+        let completions = rank_completion_candidates(
+            &dict,
+            &chars("in"),
+            &CompletionContext::default(),
+            &misspelled_words,
+            50,
         );
+
+        assert_eq!(completions[0].word, "in");
+        assert!(!should_commit_space(&completions));
+    }
+
+    #[test]
+    fn local_frequency_boosts_repeated_document_words() {
+        let dict = dict_with_words(&[("food", false), ("fool", false)]);
+        let mut context = CompletionContext::default();
+        context.local_word_counts.insert("food".to_string(), 3);
+
+        let words = ranked_words("foo", &dict, &context);
+
+        assert_eq!(words[0], "food");
+    }
+
+    #[test]
+    fn previous_word_context_breaks_close_ties() {
+        let dict = dict_with_words(&[("food", false), ("fool", false)]);
+        let mut context = CompletionContext {
+            previous_word: Some("eat".to_string()),
+            ..Default::default()
+        };
+        context
+            .previous_word_counts
+            .insert(("eat".to_string(), "fool".to_string()), 2);
+
+        let words = ranked_words("foo", &dict, &context);
+
+        assert_eq!(words[0], "fool");
+    }
+
+    #[test]
+    fn confident_top_candidate_commits_on_space() {
+        let dict = dict_with_words(&[("toy", true), ("the", true)]);
+        let misspelled_words = HashSet::new();
+        let completions = rank_completion_candidates(
+            &dict,
+            &chars("teh"),
+            &CompletionContext::default(),
+            &misspelled_words,
+            50,
+        );
+
+        assert_eq!(completions[0].word, "the");
+        assert!(should_commit_space(&completions));
+    }
+
+    #[test]
+    fn commit_with_space_never_disables_space_commit() {
+        let dict = dict_with_words(&[("toy", true), ("the", true)]);
+        let misspelled_words = HashSet::new();
+        let completions = rank_completion_candidates(
+            &dict,
+            &chars("teh"),
+            &CompletionContext::default(),
+            &misspelled_words,
+            50,
+        );
+
+        assert!(!should_item_commit_space(
+            0,
+            &completions,
+            CompletionCommitWithSpace::Never
+        ));
+    }
+
+    #[test]
+    fn commit_with_space_always_enables_every_item() {
+        let dict = dict_with_words(&[("toy", true), ("the", true)]);
+        let misspelled_words = HashSet::new();
+        let completions = rank_completion_candidates(
+            &dict,
+            &chars("teh"),
+            &CompletionContext::default(),
+            &misspelled_words,
+            50,
+        );
+
+        assert!(should_item_commit_space(
+            0,
+            &completions,
+            CompletionCommitWithSpace::Always
+        ));
+        assert!(should_item_commit_space(
+            1,
+            &completions,
+            CompletionCommitWithSpace::Always
+        ));
+    }
+
+    #[test]
+    fn prefix_score_checks_candidate_prefix_windows() {
+        let score = best_completion_prefix_score(&chars("whie"), &chars("while")).unwrap();
+
+        assert_eq!(score.distance, INSERT_DELETE_COST);
+        assert_eq!(score.matched_prefix_len, 5);
     }
 
     #[test]
@@ -1666,11 +2038,5 @@ mod completion_ranking_tests {
 
         let two_letter_caps = chars("IP");
         assert_eq!(apply_prefix_casing(&two_letter_caps, "iphone"), "IPHONE");
-    }
-
-    #[test]
-    fn test_transposition_detection() {
-        assert!(is_simple_transposition(&chars("teh"), &chars("the")));
-        assert!(!is_simple_transposition(&chars("teh"), &chars("ten")));
     }
 }
