@@ -52,6 +52,18 @@ pub trait Dictionary: Send + Sync {
     /// Look for words with a specific prefix
     fn find_words_with_prefix(&self, prefix: &[char]) -> Vec<Cow<'_, [char]>>;
 
+    /// Look for words with a specific prefix, stopping after enough candidates.
+    fn find_words_with_prefix_limited(
+        &self,
+        prefix: &[char],
+        max_results: usize,
+    ) -> Vec<Cow<'_, [char]>> {
+        self.find_words_with_prefix(prefix)
+            .into_iter()
+            .take(max_results)
+            .collect()
+    }
+
     /// Look for words that share a prefix with the provided word
     fn find_words_with_common_prefix(&self, word: &[char]) -> Vec<Cow<'_, [char]>>;
 }

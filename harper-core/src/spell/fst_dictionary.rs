@@ -1,5 +1,5 @@
 use super::{MutableDictionary, WordId};
-use fst::{IntoStreamer, Map as FstMap, Streamer, map::StreamWithState};
+use fst::{Automaton, IntoStreamer, Map as FstMap, Streamer, automaton::Str, map::StreamWithState};
 use lazy_static::lazy_static;
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
 use std::borrow::Cow;
@@ -215,7 +215,32 @@ impl Dictionary for FstDictionary {
     }
 
     fn find_words_with_prefix(&self, prefix: &[char]) -> Vec<Cow<'_, [char]>> {
-        self.mutable_dict.find_words_with_prefix(prefix)
+        self.find_words_with_prefix_limited(prefix, usize::MAX)
+    }
+
+    fn find_words_with_prefix_limited(
+        &self,
+        prefix: &[char],
+        max_results: usize,
+    ) -> Vec<Cow<'_, [char]>> {
+        if max_results == 0 {
+            return Vec::new();
+        }
+
+        let prefix: String = prefix.iter().collect();
+        let query = Str::new(&prefix).starts_with();
+        let mut stream = self.word_map.search(query).into_stream();
+        let mut found = Vec::new();
+
+        while let Some((_, word_index)) = stream.next() {
+            let (word, _) = &self.words[word_index as usize];
+            found.push(Cow::Borrowed(word.as_slice()));
+            if found.len() >= max_results {
+                break;
+            }
+        }
+
+        found
     }
 
     fn find_words_with_common_prefix(&self, word: &[char]) -> Vec<Cow<'_, [char]>> {
@@ -227,8 +252,8 @@ impl Dictionary for FstDictionary {
 mod tests {
     use itertools::Itertools;
 
-    use crate::CharStringExt;
     use crate::spell::{Dictionary, WordId};
+    use crate::{CharStringExt, DictWordMetadata};
 
     use super::FstDictionary;
 
@@ -281,6 +306,26 @@ mod tests {
         assert!(
             dict.word_map.contains_key(misspelled_lower)
                 || dict.word_map.contains_key(misspelled_word)
+        );
+    }
+
+    #[test]
+    fn prefix_lookup_respects_limit() {
+        let dict = FstDictionary::new(
+            ["predict", "prelude", "preview", "dwight"]
+                .into_iter()
+                .map(|word| (word.chars().collect(), DictWordMetadata::default()))
+                .collect(),
+        );
+
+        let prefix: Vec<_> = "pre".chars().collect();
+        let limited = dict.find_words_with_prefix_limited(&prefix, 2);
+
+        assert_eq!(limited.len(), 2);
+        assert!(
+            limited
+                .iter()
+                .all(|word| word.iter().collect::<String>().starts_with("pre"))
         );
     }
 

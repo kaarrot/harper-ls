@@ -237,6 +237,18 @@ impl Dictionary for MutableDictionary {
     }
 
     fn find_words_with_prefix(&self, prefix: &[char]) -> Vec<Cow<'_, [char]>> {
+        self.find_words_with_prefix_limited(prefix, usize::MAX)
+    }
+
+    fn find_words_with_prefix_limited(
+        &self,
+        prefix: &[char],
+        max_results: usize,
+    ) -> Vec<Cow<'_, [char]>> {
+        if max_results == 0 {
+            return Vec::new();
+        }
+
         let mut found = Vec::new();
 
         for word in self.words_iter() {
@@ -244,6 +256,9 @@ impl Dictionary for MutableDictionary {
                 && item_prefix == prefix
             {
                 found.push(Cow::Borrowed(word));
+                if found.len() >= max_results {
+                    break;
+                }
             }
         }
 

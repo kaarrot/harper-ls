@@ -71,6 +71,10 @@ struct InFlightChange {
 
 const MISSPELLED_REFRESH_DEBOUNCE_MS: u64 = 75;
 const DIAGNOSTICS_PUBLISH_DEBOUNCE_MS: u64 = 300;
+const MIN_COMPLETION_CANDIDATE_POOL: usize = 64;
+const MAX_EXACT_PREFIX_CANDIDATES: usize = 256;
+const MAX_FUZZY_COMPLETION_CANDIDATES: usize = 200;
+const MAX_NOISY_PREFIX_EXPANSION_CANDIDATES: usize = 128;
 
 pub struct Backend {
     client: Client,
@@ -231,6 +235,13 @@ fn normalized_completion_word(chars: &[char]) -> String {
     chars.iter().collect::<String>().to_lowercase()
 }
 
+fn lowercase_chars(chars: &[char]) -> Vec<char> {
+    chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect()
+}
+
 fn completion_sort_rank(
     query: &[char],
     candidate: &[char],
@@ -348,43 +359,205 @@ fn rank_completion_candidates(
 
     let mut seen = HashSet::new();
     let mut completions = Vec::new();
+    let exact_prefix_limit = exact_prefix_candidate_limit(max_results);
+    let noisy_expansion_limit = noisy_prefix_expansion_candidate_limit(max_results);
+    let noisy_expansion_per_prefix_limit = noisy_prefix_expansion_per_prefix_limit(max_results);
+    let mut noisy_expansion_count = 0;
 
-    for word in dict.words_iter() {
-        if !starts_with_ignore_case(word, prefix)
-            && !should_score_noisy_prefix_candidate(prefix, word)
+    add_exact_prefix_completion_candidates(
+        dict,
+        prefix,
+        prefix,
+        context,
+        misspelled_words,
+        &mut seen,
+        &mut completions,
+        max_results,
+        exact_prefix_limit,
+    );
+
+    let lowercase_prefix = lowercase_chars(prefix);
+    if lowercase_prefix != prefix {
+        add_exact_prefix_completion_candidates(
+            dict,
+            &lowercase_prefix,
+            prefix,
+            context,
+            misspelled_words,
+            &mut seen,
+            &mut completions,
+            max_results,
+            exact_prefix_limit,
+        );
+    }
+
+    for fuzzy_match in dict.fuzzy_match(
+        prefix,
+        allowed_noisy_prefix_edits(prefix.len()) as u8,
+        fuzzy_completion_candidate_limit(max_results),
+    ) {
+        if !starts_with_ignore_case(fuzzy_match.word, prefix)
+            && !should_score_noisy_prefix_candidate(prefix, fuzzy_match.word)
         {
             continue;
         }
 
-        let normalized_word = normalized_completion_word(word);
-        if !seen.insert(normalized_word.clone()) {
-            continue;
-        }
-
-        if misspelled_words.contains(&normalized_word) {
-            continue;
-        }
-
-        let Some(prefix_score) = best_completion_prefix_score(prefix, word) else {
-            continue;
-        };
-
-        let is_common = dict
-            .get_word_metadata(word)
-            .is_some_and(|metadata| metadata.common);
-        let rank = completion_sort_rank(prefix, word, prefix_score, is_common, context);
-
-        insert_ranked_completion(
+        score_completion_candidate(
+            dict,
+            prefix,
+            context,
+            misspelled_words,
+            &mut seen,
             &mut completions,
-            RankedCompletion {
-                word: word.iter().collect(),
-                rank,
-            },
+            fuzzy_match.word,
+            max_results,
+        );
+
+        if !starts_with_ignore_case(fuzzy_match.word, prefix)
+            && noisy_expansion_count < noisy_expansion_limit
+        {
+            let remaining_limit = noisy_expansion_limit - noisy_expansion_count;
+            noisy_expansion_count += add_noisy_prefix_expansion_candidates(
+                dict,
+                prefix,
+                fuzzy_match.word,
+                context,
+                misspelled_words,
+                &mut seen,
+                &mut completions,
+                max_results,
+                noisy_expansion_per_prefix_limit.min(remaining_limit),
+            );
+        }
+    }
+
+    completions
+}
+
+fn exact_prefix_candidate_limit(max_results: usize) -> usize {
+    max_results
+        .saturating_mul(32)
+        .clamp(MIN_COMPLETION_CANDIDATE_POOL, MAX_EXACT_PREFIX_CANDIDATES)
+}
+
+fn fuzzy_completion_candidate_limit(max_results: usize) -> usize {
+    max_results.saturating_mul(24).clamp(
+        MIN_COMPLETION_CANDIDATE_POOL,
+        MAX_FUZZY_COMPLETION_CANDIDATES,
+    )
+}
+
+fn noisy_prefix_expansion_candidate_limit(max_results: usize) -> usize {
+    max_results.saturating_mul(16).clamp(
+        MIN_COMPLETION_CANDIDATE_POOL / 2,
+        MAX_NOISY_PREFIX_EXPANSION_CANDIDATES,
+    )
+}
+
+fn noisy_prefix_expansion_per_prefix_limit(max_results: usize) -> usize {
+    max_results.saturating_mul(2).clamp(4, 16)
+}
+
+fn add_exact_prefix_completion_candidates(
+    dict: &dyn Dictionary,
+    prefix_lookup: &[char],
+    ranking_prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    seen: &mut HashSet<String>,
+    completions: &mut Vec<RankedCompletion>,
+    max_results: usize,
+    candidate_limit: usize,
+) {
+    for word in dict.find_words_with_prefix_limited(prefix_lookup, candidate_limit) {
+        if !starts_with_ignore_case(word.as_ref(), ranking_prefix) {
+            continue;
+        }
+
+        score_completion_candidate(
+            dict,
+            ranking_prefix,
+            context,
+            misspelled_words,
+            seen,
+            completions,
+            word.as_ref(),
+            max_results,
+        );
+    }
+}
+
+fn add_noisy_prefix_expansion_candidates(
+    dict: &dyn Dictionary,
+    ranking_prefix: &[char],
+    corrected_prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    seen: &mut HashSet<String>,
+    completions: &mut Vec<RankedCompletion>,
+    max_results: usize,
+    candidate_limit: usize,
+) -> usize {
+    let mut considered = 0;
+
+    for word in dict.find_words_with_prefix_limited(corrected_prefix, candidate_limit) {
+        considered += 1;
+
+        if same_word_ignore_case(word.as_ref(), corrected_prefix) {
+            continue;
+        }
+
+        score_completion_candidate(
+            dict,
+            ranking_prefix,
+            context,
+            misspelled_words,
+            seen,
+            completions,
+            word.as_ref(),
             max_results,
         );
     }
 
-    completions
+    considered
+}
+
+fn score_completion_candidate(
+    dict: &dyn Dictionary,
+    prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    seen: &mut HashSet<String>,
+    completions: &mut Vec<RankedCompletion>,
+    word: &[char],
+    max_results: usize,
+) {
+    let normalized_word = normalized_completion_word(word);
+    if !seen.insert(normalized_word.clone()) {
+        return;
+    }
+
+    if misspelled_words.contains(&normalized_word) {
+        return;
+    }
+
+    let Some(prefix_score) = best_completion_prefix_score(prefix, word) else {
+        return;
+    };
+
+    let is_common = dict
+        .get_word_metadata(word)
+        .is_some_and(|metadata| metadata.common);
+    let rank = completion_sort_rank(prefix, word, prefix_score, is_common, context);
+
+    insert_ranked_completion(
+        completions,
+        RankedCompletion {
+            word: word.iter().collect(),
+            rank,
+        },
+        max_results,
+    );
 }
 
 fn compare_ranked_completion(a: &RankedCompletion, b: &RankedCompletion) -> Ordering {
@@ -1843,6 +2016,15 @@ mod completion_ranking_tests {
     }
 
     #[test]
+    fn uppercase_prefix_uses_exact_prefix_candidates() {
+        let dict = dict_with_words(&[("predict", true), ("prediction", true), ("prod", true)]);
+        let words = ranked_words("Pred", &dict, &CompletionContext::default());
+
+        assert_eq!(words[0], "predict");
+        assert_eq!(words[1], "prediction");
+    }
+
+    #[test]
     fn ranking_limits_returned_candidates() {
         let dict = dict_with_words(&[
             ("abacus", true),
@@ -1902,6 +2084,15 @@ mod completion_ranking_tests {
         let words = ranked_words("rigth", &dict, &CompletionContext::default());
 
         assert_eq!(words[0], "right");
+    }
+
+    #[test]
+    fn noisy_prefix_includes_long_prefix_expansions() {
+        let dict = dict_with_words(&[("right", true), ("righteous", true), ("rightful", true)]);
+        let words = ranked_words("rigth", &dict, &CompletionContext::default());
+
+        assert!(words.iter().any(|word| word == "righteous"));
+        assert!(words.iter().any(|word| word == "rightful"));
     }
 
     #[test]

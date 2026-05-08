@@ -97,9 +97,17 @@ impl<D: Dictionary> Dictionary for TrieDictionary<D> {
     }
 
     fn find_words_with_prefix(&self, prefix: &[char]) -> Vec<Cow<'_, [char]>> {
+        self.find_words_with_prefix_limited(prefix, usize::MAX)
+    }
+
+    fn find_words_with_prefix_limited(
+        &self,
+        prefix: &[char],
+        max_results: usize,
+    ) -> Vec<Cow<'_, [char]>> {
         let results: Keys<SearchIter<'_, char, (), Vec<char>, _>> =
             self.trie.predictive_search(prefix);
-        results.map(Cow::Owned).collect()
+        results.take(max_results).map(Cow::Owned).collect()
     }
 
     fn find_words_with_common_prefix(&self, word: &[char]) -> Vec<Cow<'_, [char]>> {

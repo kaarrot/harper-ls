@@ -163,11 +163,24 @@ impl Dictionary for MergedDictionary {
     }
 
     fn find_words_with_prefix(&self, prefix: &[char]) -> Vec<Cow<'_, [char]>> {
+        self.find_words_with_prefix_limited(prefix, usize::MAX)
+    }
+
+    fn find_words_with_prefix_limited(
+        &self,
+        prefix: &[char],
+        max_results: usize,
+    ) -> Vec<Cow<'_, [char]>> {
+        if max_results == 0 {
+            return Vec::new();
+        }
+
         self.children
             .iter()
-            .flat_map(|dict| dict.find_words_with_prefix(prefix))
+            .flat_map(|dict| dict.find_words_with_prefix_limited(prefix, max_results))
             .sorted()
             .dedup()
+            .take(max_results)
             .collect()
     }
 
