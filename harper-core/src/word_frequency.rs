@@ -89,6 +89,34 @@ pub fn bigram_rank(previous_word: &str, word: &str) -> Option<u32> {
     bigram_ranks().get(key.to_lowercase().as_str()).copied()
 }
 
+/// The most frequent English words that start with `prefix`, in descending frequency
+/// order, up to `limit` results.
+///
+/// Completion candidates are otherwise fetched from the dictionary in alphabetical
+/// order and truncated, which can drop very common words that sort late within a
+/// prefix (e.g. "could"/"come" sit far past the start of the "co" words). Seeding the
+/// candidate pool from this list keeps those words in contention. Matching is
+/// case-insensitive; returned words are lowercase slices into the bundled list.
+pub fn most_frequent_with_prefix(prefix: &str, limit: usize) -> Vec<&'static str> {
+    if prefix.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let prefix_lower = prefix.to_lowercase();
+    let mut matches = Vec::new();
+    for line in RAW_FREQUENCY_LIST.lines() {
+        let word = line.trim();
+        if word.starts_with(prefix_lower.as_str()) {
+            matches.push(word);
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +171,31 @@ mod tests {
     #[test]
     fn unknown_bigram_has_no_rank() {
         assert_eq!(bigram_rank("zzqqx", "wwvvqq"), None);
+    }
+
+    #[test]
+    fn most_frequent_with_prefix_is_frequency_ordered() {
+        let words = most_frequent_with_prefix("th", 5);
+        assert_eq!(words.first(), Some(&"the"));
+        assert!(words.len() <= 5);
+        assert!(words.iter().all(|word| word.starts_with("th")));
+    }
+
+    #[test]
+    fn most_frequent_with_prefix_surfaces_alphabetically_late_words() {
+        // "could"/"come" sort late within the "co" words but are very frequent.
+        let words = most_frequent_with_prefix("co", 100);
+        assert!(words.contains(&"could"));
+        assert!(words.contains(&"come"));
+    }
+
+    #[test]
+    fn most_frequent_with_prefix_respects_limit_and_case() {
+        assert!(most_frequent_with_prefix("th", 3).len() <= 3);
+        assert_eq!(
+            most_frequent_with_prefix("TH", 3),
+            most_frequent_with_prefix("th", 3)
+        );
+        assert!(most_frequent_with_prefix("", 5).is_empty());
     }
 }

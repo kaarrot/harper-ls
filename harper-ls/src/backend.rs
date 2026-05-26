@@ -23,7 +23,7 @@ use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
 };
 use harper_core::spell::{Dictionary, FstDictionary, MergedDictionary, MutableDictionary};
-use harper_core::word_frequency::{bigram_rank, frequency_rank};
+use harper_core::word_frequency::{bigram_rank, frequency_rank, most_frequent_with_prefix};
 use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints, TokenKind};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
@@ -403,6 +403,17 @@ fn rank_completion_candidates(
         );
     }
 
+    add_frequent_prefix_completion_candidates(
+        dict,
+        prefix,
+        context,
+        misspelled_words,
+        &mut seen,
+        &mut completions,
+        max_results,
+        frequent_prefix_candidate_limit(max_results),
+    );
+
     for fuzzy_match in dict.fuzzy_match(
         prefix,
         allowed_noisy_prefix_edits(prefix.len()) as u8,
@@ -470,6 +481,10 @@ fn noisy_prefix_expansion_per_prefix_limit(max_results: usize) -> usize {
     max_results.saturating_mul(2).clamp(4, 16)
 }
 
+fn frequent_prefix_candidate_limit(max_results: usize) -> usize {
+    max_results.saturating_mul(2).clamp(32, 128)
+}
+
 fn add_exact_prefix_completion_candidates(
     dict: &dyn Dictionary,
     prefix_lookup: &[char],
@@ -494,6 +509,40 @@ fn add_exact_prefix_completion_candidates(
             seen,
             completions,
             word.as_ref(),
+            max_results,
+        );
+    }
+}
+
+fn add_frequent_prefix_completion_candidates(
+    dict: &dyn Dictionary,
+    prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    seen: &mut HashSet<String>,
+    completions: &mut Vec<RankedCompletion>,
+    max_results: usize,
+    candidate_limit: usize,
+) {
+    let prefix_string: String = prefix.iter().collect();
+
+    for word in most_frequent_with_prefix(&prefix_string, candidate_limit) {
+        let word_chars: Vec<char> = word.chars().collect();
+
+        // Only surface words present in the active dictionary so the frequency list
+        // never introduces non-words (e.g. "http") as completions.
+        if !dict.contains_exact_word(&word_chars) {
+            continue;
+        }
+
+        score_completion_candidate(
+            dict,
+            prefix,
+            context,
+            misspelled_words,
+            seen,
+            completions,
+            &word_chars,
             max_results,
         );
     }
@@ -2226,6 +2275,18 @@ mod completion_ranking_tests {
         // reordering comes from the bigram signal, not from "york" itself.
         let no_context = ranked_words("yo", &dict, &CompletionContext::default());
         assert_eq!(no_context[0], "you");
+    }
+
+    #[test]
+    fn frequency_seeding_surfaces_common_words_past_the_alphabetical_window() {
+        // In the real dictionary, "could"/"come" sort far past the start of the "co"
+        // words, so the bounded alphabetical fetch alone misses them. Frequency seeding
+        // pulls these very common words into the candidate pool for prefix "co".
+        let dict = FstDictionary::curated();
+        let words = ranked_words("co", dict.as_ref(), &CompletionContext::default());
+
+        assert!(words.iter().any(|word| word == "could"));
+        assert!(words.iter().any(|word| word == "come"));
     }
 
     #[test]
