@@ -2278,6 +2278,49 @@ mod completion_ranking_tests {
     }
 
     #[test]
+    fn fat_finger_adjacent_key_typos_rank_intended_word_first() {
+        // Characterization corpus for adjacent-key "fat-finger" typos: one key replaced
+        // by a physical neighbor on the phone QWERTY layout. Pins current behavior so a
+        // future keyboard cost-model tweak (keyboard_distance.rs) can't silently regress
+        // it. Each typo should make its intended word the top suggestion.
+        let dict = FstDictionary::curated();
+        let cases = [
+            ("tge", "the"),         // g <-> h
+            ("wprk", "work"),       // o <-> p
+            ("wirk", "work"),       // i <-> o
+            ("abiut", "about"),     // o <-> i
+            ("tjis", "this"),       // h <-> j
+            ("wuth", "with"),       // i <-> u
+            ("fimd", "find"),       // n <-> m
+            ("yhe", "the"),         // t <-> y
+            ("soace", "space"),     // o <-> p
+            ("befpre", "before"),   // o <-> p
+            ("vould", "could"),     // c <-> v
+            ("shoukd", "should"),   // l <-> k
+            ("wjat", "what"),       // h <-> j
+            ("snd", "and"),         // a <-> s
+            ("becauae", "because"), // s <-> a
+        ];
+
+        let mut failures = Vec::new();
+        for (typo, expected) in cases {
+            let words = ranked_words(typo, dict.as_ref(), &CompletionContext::default());
+            if words.first().map(String::as_str) != Some(expected) {
+                let top5: Vec<&String> = words.iter().take(5).collect();
+                failures.push(format!(
+                    "{typo:?} -> expected {expected:?} first, got {top5:?}"
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "adjacent-key typos not ranked #1:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
     fn frequency_seeding_surfaces_common_words_past_the_alphabetical_window() {
         // In the real dictionary, "could"/"come" sort far past the start of the "co"
         // words, so the bounded alphabetical fetch alone misses them. Frequency seeding
