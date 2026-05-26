@@ -23,6 +23,7 @@ use harper_core::parsers::{
     CollapseIdentifiers, IsolateEnglish, Markdown, OrgMode, Parser, PlainEnglish,
 };
 use harper_core::spell::{Dictionary, FstDictionary, MergedDictionary, MutableDictionary};
+use harper_core::word_frequency::{bigram_rank, frequency_rank};
 use harper_core::{Dialect, DictWordMetadata, Document, IgnoredLints, TokenKind};
 use harper_html::HtmlParser;
 use harper_ink::InkParser;
@@ -97,6 +98,8 @@ struct CompletionSortRank {
     is_common: bool,
     local_frequency: usize,
     previous_word_frequency: usize,
+    global_bigram_rank: u32,
+    global_frequency_rank: u32,
     remaining_ambiguity: usize,
     replacement_len: usize,
 }
@@ -159,15 +162,6 @@ fn max_noisy_prefix_distance(prefix_len: usize) -> u16 {
     (allowed_noisy_prefix_edits(prefix_len) as u16).saturating_mul(INSERT_DELETE_COST)
 }
 
-fn exact_prefix_extension_penalty(query_len: usize, remaining_ambiguity: usize) -> u16 {
-    if remaining_ambiguity == 0 {
-        return 0;
-    }
-
-    let per_char = if query_len <= 3 { 20 } else { 5 };
-    (remaining_ambiguity as u16).saturating_mul(per_char)
-}
-
 fn best_completion_prefix_score(
     query: &[char],
     candidate: &[char],
@@ -177,9 +171,13 @@ fn best_completion_prefix_score(
     }
 
     if starts_with_ignore_case(candidate, query) {
-        let remaining_ambiguity = candidate.len().saturating_sub(query.len());
+        // Exact-prefix matches carry no correction distance — the user typed a real
+        // prefix of the candidate, not a typo. Completion length is preferred only as
+        // a low-priority tiebreaker (`remaining_ambiguity`), which sits below global
+        // frequency, so a frequent longer word (e.g. "world") still beats a rare
+        // shorter one (e.g. "worm").
         return Some(CompletionPrefixScore {
-            distance: exact_prefix_extension_penalty(query.len(), remaining_ambiguity),
+            distance: 0,
             exact_prefix: true,
             matched_prefix_len: query.len(),
         });
@@ -278,6 +276,12 @@ fn completion_sort_rank(
             .copied()
             .unwrap_or(0),
         previous_word_frequency,
+        global_bigram_rank: context
+            .previous_word
+            .as_ref()
+            .and_then(|previous_word| bigram_rank(previous_word, &normalized_candidate))
+            .unwrap_or(u32::MAX),
+        global_frequency_rank: frequency_rank(&normalized_candidate).unwrap_or(u32::MAX),
         remaining_ambiguity: candidate
             .len()
             .saturating_sub(prefix_score.matched_prefix_len),
@@ -298,6 +302,14 @@ fn compare_completion_ranks(a: &CompletionSortRank, b: &CompletionSortRank) -> O
         .then_with(|| b.is_common.cmp(&a.is_common))
         .then_with(|| b.local_frequency.cmp(&a.local_frequency))
         .then_with(|| b.previous_word_frequency.cmp(&a.previous_word_frequency))
+        // Global collocation strength (lower rank = more common pair). Sits below the
+        // document's own bigram context but above raw unigram frequency, so after
+        // "new" the prefix "yo" surfaces "york" ahead of the more frequent "you".
+        .then_with(|| a.global_bigram_rank.cmp(&b.global_bigram_rank))
+        // Global usage frequency (lower rank = more frequent). Sits below document
+        // context so personalization wins, but above length/alphabetical so common
+        // words like "work" beat rare same-length ones like "worm".
+        .then_with(|| a.global_frequency_rank.cmp(&b.global_frequency_rank))
         .then_with(|| a.remaining_ambiguity.cmp(&b.remaining_ambiguity))
         .then_with(|| a.replacement_len.cmp(&b.replacement_len))
 }
@@ -2006,22 +2018,29 @@ mod completion_ranking_tests {
             ("prey", true),
         ]);
         let words = ranked_words("pred", &dict, &CompletionContext::default());
+        let position = |target: &str| words.iter().position(|word| word == target).unwrap();
 
-        assert_eq!(words[0], "predict");
-        assert_eq!(words[1], "prediction");
-        assert!(
-            words.iter().position(|word| word == "predict").unwrap()
-                < words.iter().position(|word| word == "prod").unwrap()
-        );
+        // Exact-prefix completions rank ahead of fuzzy matches like "prod"/"prey".
+        assert!(position("predict") < position("prod"));
+        assert!(position("prediction") < position("prod"));
+        assert!(position("predict") < position("prey"));
+        assert!(position("prediction") < position("prey"));
+        // Between the two completions, global frequency decides: "prediction" is more
+        // frequent than "predict" in the bundled list, so it ranks first.
+        assert!(position("prediction") < position("predict"));
     }
 
     #[test]
     fn uppercase_prefix_uses_exact_prefix_candidates() {
         let dict = dict_with_words(&[("predict", true), ("prediction", true), ("prod", true)]);
         let words = ranked_words("Pred", &dict, &CompletionContext::default());
+        let position = |target: &str| words.iter().position(|word| word == target).unwrap();
 
-        assert_eq!(words[0], "predict");
-        assert_eq!(words[1], "prediction");
+        // The uppercase prefix still surfaces the exact-prefix completions ahead of
+        // the fuzzy "prod"; frequency orders "prediction" before "predict".
+        assert!(position("predict") < position("prod"));
+        assert!(position("prediction") < position("prod"));
+        assert!(position("prediction") < position("predict"));
     }
 
     #[test]
@@ -2144,6 +2163,69 @@ mod completion_ranking_tests {
         let words = ranked_words("foo", &dict, &context);
 
         assert_eq!(words[0], "fool");
+    }
+
+    #[test]
+    fn global_frequency_orders_equal_distance_completions() {
+        // work/word/worn/worm are all equal-distance exact-prefix matches of "wor"
+        // and all flagged common, so only global usage frequency separates them.
+        let dict = dict_with_words(&[
+            ("work", true),
+            ("word", true),
+            ("worm", true),
+            ("worn", true),
+        ]);
+        let words = ranked_words("wor", &dict, &CompletionContext::default());
+        let position = |target: &str| words.iter().position(|word| word == target).unwrap();
+
+        assert_eq!(words[0], "work");
+        assert!(position("work") < position("word"));
+        assert!(position("word") < position("worn"));
+        assert!(position("worn") < position("worm"));
+    }
+
+    #[test]
+    fn frequent_longer_word_outranks_rare_shorter_word() {
+        // "world" (5 letters, extremely common) must beat the shorter "worm"/"worn"
+        // (4 letters, rare). Before P2 the per-character length penalty buried the
+        // longer word; now frequency wins over the shortest-first bias.
+        let dict = dict_with_words(&[
+            ("worm", true),
+            ("worn", true),
+            ("work", true),
+            ("world", true),
+        ]);
+        let words = ranked_words("wor", &dict, &CompletionContext::default());
+        let position = |target: &str| words.iter().position(|word| word == target).unwrap();
+
+        assert_eq!(words[0], "world");
+        assert!(position("world") < position("worm"));
+        assert!(position("world") < position("worn"));
+    }
+
+    #[test]
+    fn global_bigram_boosts_context_word_over_more_frequent_unigram() {
+        let dict = dict_with_words(&[
+            ("you", true),
+            ("your", true),
+            ("york", true),
+            ("young", true),
+            ("youth", true),
+        ]);
+
+        // After "new", the strong global bigram "new york" lifts the rarer unigram
+        // "york" to the top for prefix "yo".
+        let after_new = CompletionContext {
+            previous_word: Some("new".to_string()),
+            ..Default::default()
+        };
+        let words = ranked_words("yo", &dict, &after_new);
+        assert_eq!(words[0], "york");
+
+        // Without that context, plain unigram frequency leads with "you" — proving the
+        // reordering comes from the bigram signal, not from "york" itself.
+        let no_context = ranked_words("yo", &dict, &CompletionContext::default());
+        assert_eq!(no_context[0], "you");
     }
 
     #[test]
