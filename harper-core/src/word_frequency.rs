@@ -53,17 +53,19 @@ pub fn frequency_rank(word: &str) -> Option<u32> {
     frequency_ranks().get(word.to_lowercase().as_str()).copied()
 }
 
-fn bigram_ranks() -> &'static HashMap<&'static str, u32> {
-    static RANKS: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+fn bigram_ranks() -> &'static HashMap<&'static str, HashMap<&'static str, u32>> {
+    static RANKS: OnceLock<HashMap<&'static str, HashMap<&'static str, u32>>> = OnceLock::new();
     RANKS.get_or_init(|| {
-        let mut ranks = HashMap::new();
+        let mut ranks: HashMap<&'static str, HashMap<&'static str, u32>> = HashMap::new();
         for (rank, line) in RAW_BIGRAM_LIST.lines().enumerate() {
             let pair = line.trim();
             if pair.is_empty() {
                 continue;
             }
             // Keep the first (most frequent) occurrence of any duplicated pair.
-            ranks.entry(pair).or_insert(rank as u32);
+            if let Some((w1, w2)) = pair.split_once(' ') {
+                ranks.entry(w1).or_default().entry(w2).or_insert(rank as u32);
+            }
         }
         ranks
     })
@@ -80,13 +82,35 @@ pub fn bigram_rank(previous_word: &str, word: &str) -> Option<u32> {
         return None;
     }
 
-    // The list is lowercase; callers normalize before lookup, so this usually hits.
-    let key = format!("{previous_word} {word}");
-    if let Some(rank) = bigram_ranks().get(key.as_str()).copied() {
-        return Some(rank);
+    // Fast path: callers normalize to lowercase before calling, so this usually hits
+    // without any allocation.
+    if let Some(inner) = bigram_ranks().get(previous_word) {
+        if let Some(&rank) = inner.get(word) {
+            return Some(rank);
+        }
     }
 
-    bigram_ranks().get(key.to_lowercase().as_str()).copied()
+    // Fallback: lowercase lookup (fires when caller hasn't pre-normalized).
+    let prev_lower = previous_word.to_lowercase();
+    let word_lower = word.to_lowercase();
+    bigram_ranks()
+        .get(prev_lower.as_str())?
+        .get(word_lower.as_str())
+        .copied()
+}
+
+/// Alphabetically-sorted view of the frequency list: `(word, rank)` pairs sorted by
+/// word. Used for binary-search prefix lookup in `most_frequent_with_prefix`.
+fn frequency_sorted_alpha() -> &'static [(&'static str, u32)] {
+    static SORTED: OnceLock<Vec<(&'static str, u32)>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut pairs: Vec<(&'static str, u32)> = frequency_ranks()
+            .iter()
+            .map(|(&word, &rank)| (word, rank))
+            .collect();
+        pairs.sort_unstable_by_key(|(word, _)| *word);
+        pairs
+    })
 }
 
 /// The most frequent English words that start with `prefix`, in descending frequency
@@ -103,18 +127,21 @@ pub fn most_frequent_with_prefix(prefix: &str, limit: usize) -> Vec<&'static str
     }
 
     let prefix_lower = prefix.to_lowercase();
-    let mut matches = Vec::new();
-    for line in RAW_FREQUENCY_LIST.lines() {
-        let word = line.trim();
-        if word.starts_with(prefix_lower.as_str()) {
-            matches.push(word);
-            if matches.len() >= limit {
-                break;
-            }
-        }
-    }
+    let prefix_str = prefix_lower.as_str();
+    let sorted = frequency_sorted_alpha();
 
-    matches
+    // Binary-search to the first word >= prefix, then scan forward while words still
+    // start with the prefix. Sort the matching slice by rank and take up to limit.
+    let start = sorted.partition_point(|(word, _)| *word < prefix_str);
+
+    let mut matches: Vec<(u32, &'static str)> = sorted[start..]
+        .iter()
+        .take_while(|(word, _)| word.starts_with(prefix_str))
+        .map(|(word, rank)| (*rank, *word))
+        .collect();
+
+    matches.sort_unstable_by_key(|(rank, _)| *rank);
+    matches.into_iter().take(limit).map(|(_, word)| word).collect()
 }
 
 #[cfg(test)]
