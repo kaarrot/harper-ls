@@ -40,13 +40,14 @@ use tower_lsp_server::lsp_types::notification::PublishDiagnostics;
 use tower_lsp_server::lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    ConfigurationItem, Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, ExecuteCommandOptions,
-    ExecuteCommandParams, FileChangeType, FileSystemWatcher, GlobPattern, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, PublishDiagnosticsParams, Range,
-    Registration, ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri, WatchKind,
+    CompletionTextEdit, ConfigurationItem, Diagnostic, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, ExecuteCommandOptions, ExecuteCommandParams, FileChangeType,
+    FileSystemWatcher, GlobPattern, InitializeParams, InitializeResult, InitializedParams,
+    MessageType, PublishDiagnosticsParams, Range, Registration, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Uri, WatchKind,
 };
 use tower_lsp_server::{Client, LanguageServer, UriExt};
 use tracing::{error, info, warn};
@@ -76,6 +77,9 @@ const MIN_COMPLETION_CANDIDATE_POOL: usize = 64;
 const MAX_EXACT_PREFIX_CANDIDATES: usize = 256;
 const MAX_FUZZY_COMPLETION_CANDIDATES: usize = 200;
 const MAX_NOISY_PREFIX_EXPANSION_CANDIDATES: usize = 128;
+/// Bottom-row phone keyboard keys adjacent to the spacebar; pressing one of
+/// these instead of space fuses two words into one token (e.g. "thenworld").
+const SPACE_ADJACENT_KEYS: &[char] = &['v', 'b', 'n', 'm'];
 
 pub struct Backend {
     client: Client,
@@ -356,6 +360,34 @@ fn build_completion_context(
     }
 
     context
+}
+
+/// Checks whether `prefix` contains a space-adjacent key (v/b/n/m) that the
+/// user may have pressed instead of the spacebar. Returns every position where
+/// the characters before the split form a valid dictionary word and there are
+/// at least `min_right_len` characters after it to complete.
+fn find_missed_space_splits(
+    prefix: &[char],
+    dict: &dyn Dictionary,
+    min_right_len: usize,
+) -> Vec<(Vec<char>, Vec<char>)> {
+    let mut splits = Vec::new();
+    for i in 1..prefix.len() {
+        let ch = prefix[i].to_lowercase().next().unwrap_or(prefix[i]);
+        if !SPACE_ADJACENT_KEYS.contains(&ch) {
+            continue;
+        }
+        let left = &prefix[..i];
+        let right = &prefix[i + 1..];
+        if right.len() < min_right_len {
+            continue;
+        }
+        let left_lower = lowercase_chars(left);
+        if dict.contains_exact_word(&left_lower) {
+            splits.push((left.to_vec(), right.to_vec()));
+        }
+    }
+    splits
 }
 
 fn rank_completion_candidates(
@@ -1416,8 +1448,6 @@ impl Backend {
             .take(completion_config.max_results)
             .enumerate()
             .map(|(idx, completion)| {
-                use tower_lsp_server::lsp_types::{CompletionTextEdit, Range, TextEdit};
-
                 // Apply the casing from the user's prefix to the completion
                 let word_string = completion.word;
                 let completion_text = apply_prefix_casing(&prefix, &word_string);
@@ -1443,7 +1473,63 @@ impl Backend {
             })
             .collect();
 
-        Ok(completion_items)
+        // Missed-space split completions: v/b/n/m pressed instead of space fuses
+        // two words into one token (e.g. "thenworld" → offer "the world").
+        // These are appended after normal completions so they don't displace exact
+        // single-word completions, but they surface as an option the user can pick.
+        let split_min_right = completion_config.min_prefix_length.max(2);
+        let normal_count = completion_items.len();
+        let mut split_items: Vec<CompletionItem> = Vec::new();
+
+        'splits: for (left_chars, right_prefix) in
+            find_missed_space_splits(&prefix, dict.as_ref(), split_min_right)
+        {
+            let left_lower: String = lowercase_chars(&left_chars).iter().collect();
+            let split_context = CompletionContext {
+                local_word_counts: context.local_word_counts.clone(),
+                previous_word_counts: context.previous_word_counts.clone(),
+                previous_word: Some(left_lower.clone()),
+            };
+            let right_completions = rank_completion_candidates(
+                dict.as_ref(),
+                &right_prefix,
+                &split_context,
+                misspelled_words.as_ref(),
+                ranking_limit,
+            );
+            let left_display = apply_prefix_casing(&prefix[..left_chars.len()], &left_lower);
+            for rc in right_completions
+                .into_iter()
+                .take(completion_config.max_results)
+            {
+                if normal_count + split_items.len() >= 2 * completion_config.max_results {
+                    break 'splits;
+                }
+                let right_display = apply_prefix_casing(&right_prefix, &rc.word);
+                let combined_text = format!("{left_display} {right_display}");
+                let combined_label = format!("{left_lower} {}", rc.word);
+                let sort_idx = normal_count + split_items.len();
+                split_items.push(CompletionItem {
+                    label: combined_label,
+                    kind: Some(CompletionItemKind::TEXT),
+                    detail: Some("Harper".to_string()),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: Range {
+                            start: word_start_position,
+                            end: word_end_position,
+                        },
+                        new_text: combined_text,
+                    })),
+                    filter_text: Some(prefix_string.clone()),
+                    sort_text: Some(format!("{:05}", sort_idx)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let mut all_items = completion_items;
+        all_items.extend(split_items);
+        Ok(all_items)
     }
 
     /// Update the configuration of the server and publish document updates that
@@ -2415,5 +2501,71 @@ mod completion_ranking_tests {
 
         let two_letter_caps = chars("IP");
         assert_eq!(apply_prefix_casing(&two_letter_caps, "iphone"), "IPHONE");
+    }
+
+    // --- Missed-space split tests ---
+
+    #[test]
+    fn missed_space_n_splits_the_from_world() {
+        // "thenworld": user pressed 'n' instead of space → left="the", right="world"
+        let dict = dict_with_words(&[("the", true)]);
+        let splits = find_missed_space_splits(&chars("thenworld"), &dict, 2);
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].0.iter().collect::<String>(), "the");
+        assert_eq!(splits[0].1.iter().collect::<String>(), "world");
+    }
+
+    #[test]
+    fn missed_space_split_requires_left_word_in_dict() {
+        // "xhe" is not a word — no split for "xhenworld"
+        let dict = dict_with_words(&[("world", true)]);
+        assert!(find_missed_space_splits(&chars("xhenworld"), &dict, 2).is_empty());
+    }
+
+    #[test]
+    fn missed_space_split_all_four_adjacent_keys() {
+        let dict = dict_with_words(&[("in", true)]);
+        // v: "invery" → left="in", right="ery"
+        assert!(!find_missed_space_splits(&chars("invery"), &dict, 2).is_empty());
+        // b: "inbest" → left="in", right="est"
+        assert!(!find_missed_space_splits(&chars("inbest"), &dict, 2).is_empty());
+        // n: "inname" → split at second 'n', left="in", right="ame"
+        assert!(!find_missed_space_splits(&chars("inname"), &dict, 2).is_empty());
+        // m: "inmore" → left="in", right="ore"
+        assert!(!find_missed_space_splits(&chars("inmore"), &dict, 2).is_empty());
+    }
+
+    #[test]
+    fn missed_space_split_min_right_len_respected() {
+        let dict = dict_with_words(&[("the", true)]);
+        // "thenw": right part is 1 char — below min_right_len=2
+        assert!(find_missed_space_splits(&chars("thenw"), &dict, 2).is_empty());
+        // "thenwo": right part is 2 chars — exactly at min_right_len=2
+        assert!(!find_missed_space_splits(&chars("thenwo"), &dict, 2).is_empty());
+    }
+
+    #[test]
+    fn missed_space_split_curated_dict_the_world() {
+        // End-to-end check: the curated dictionary has "the", so "thenworld" splits.
+        let dict = FstDictionary::curated();
+        let splits = find_missed_space_splits(&chars("thenworld"), dict.as_ref(), 2);
+        assert!(
+            splits.iter().any(|(l, r)| {
+                l.iter().collect::<String>() == "the" && r.iter().collect::<String>() == "world"
+            }),
+            "expected to find split (the, world) in 'thenworld'"
+        );
+    }
+
+    #[test]
+    fn missed_space_split_v_key_also_detected() {
+        let dict = FstDictionary::curated();
+        let splits = find_missed_space_splits(&chars("thevworld"), dict.as_ref(), 2);
+        assert!(
+            splits.iter().any(|(l, r)| {
+                l.iter().collect::<String>() == "the" && r.iter().collect::<String>() == "world"
+            }),
+            "expected to find split (the, world) in 'thevworld'"
+        );
     }
 }
