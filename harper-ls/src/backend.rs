@@ -287,6 +287,14 @@ const FIRST_LETTER_MISMATCH_PENALTY: i32 = 120;
 /// Kept under the protections (<~76) so a common typed word isn't flipped to a
 /// same-length neighbor (e.g. "do" stays above "to").
 const HIGH_CONFIDENCE_SHORT_CORRECTION_BONUS: i32 = 40;
+/// `combined_cost` for an apostrophe-restored contraction ("im"->"I'm") when the
+/// typed letters are NOT themselves a word — the contraction is almost certainly
+/// the intent, so rank it at the top (well below the cost of any fuzzy neighbor).
+const CONTRACTION_NONWORD_PREFIX_COST: i32 = 30;
+/// `combined_cost` for an apostrophe-restored contraction when the typed letters
+/// ARE also a valid word ("were"->"we're", "id"->"I'd", "cant"->"can't"). The
+/// contraction is offered but priced so the real typed word stays competitive.
+const CONTRACTION_WORD_PREFIX_COST: i32 = 200;
 
 /// Frequency penalty in keyboard-edit-cost units. `u32::MAX` marks an unlisted word.
 fn frequency_penalty(rank: u32) -> i32 {
@@ -504,6 +512,82 @@ fn find_missed_space_splits(
     splits
 }
 
+/// Surfaces contractions typed without their apostrophe ("im"->"I'm",
+/// "weve"->"we've", "dont"->"don't"). Phone users routinely skip the apostrophe,
+/// and these words are absent from the unigram frequency list, so the normal
+/// pipeline charges an apostrophe insertion and buries them. For each interior
+/// position, inserts an apostrophe and asks the dictionary for the canonical
+/// (correctly-capitalized) word; matches are scored cheaply so they rank near the
+/// top — unless the typed letters are themselves a word, in which case the real
+/// word is kept competitive.
+fn add_contraction_completion_candidates(
+    dict: &dyn Dictionary,
+    prefix: &[char],
+    misspelled_words: &HashSet<String>,
+    seen: &mut HashSet<String>,
+    completions: &mut Vec<RankedCompletion>,
+    max_results: usize,
+) {
+    // The user already typed an apostrophe, or the token is too short to split.
+    if prefix.len() < 2 || prefix.contains(&'\'') {
+        return;
+    }
+
+    let lower = lowercase_chars(prefix);
+    let prefix_is_word = dict.contains_exact_word(&lower);
+    let cost = if prefix_is_word {
+        CONTRACTION_WORD_PREFIX_COST
+    } else {
+        CONTRACTION_NONWORD_PREFIX_COST
+    };
+
+    for i in 1..lower.len() {
+        let mut variant = Vec::with_capacity(lower.len() + 1);
+        variant.extend_from_slice(&lower[..i]);
+        variant.push('\'');
+        variant.extend_from_slice(&lower[i..]);
+
+        let Some(canonical) = dict
+            .get_correct_capitalization_of(&variant)
+            .map(<[char]>::to_vec)
+        else {
+            continue;
+        };
+
+        // Guard against a hash lookup returning a non-apostrophe word.
+        if !canonical.contains(&'\'') {
+            continue;
+        }
+
+        let normalized = normalized_completion_word(&canonical);
+        if !seen.insert(normalized.clone()) || misspelled_words.contains(&normalized) {
+            continue;
+        }
+
+        let is_common = dict
+            .get_word_metadata(&canonical)
+            .is_some_and(|metadata| metadata.common);
+
+        insert_ranked_completion(
+            completions,
+            RankedCompletion {
+                word: canonical.iter().collect(),
+                rank: CompletionSortRank {
+                    combined_cost: cost,
+                    distance: 0,
+                    exact_prefix: false,
+                    typed_word: false,
+                    first_letter_match: first_letter_matches(prefix, &canonical),
+                    is_common,
+                    remaining_ambiguity: 0,
+                    replacement_len: canonical.len(),
+                },
+            },
+            max_results,
+        );
+    }
+}
+
 fn rank_completion_candidates(
     dict: &dyn Dictionary,
     prefix: &[char],
@@ -558,6 +642,15 @@ fn rank_completion_candidates(
         &mut completions,
         max_results,
         frequent_prefix_candidate_limit(max_results),
+    );
+
+    add_contraction_completion_candidates(
+        dict,
+        prefix,
+        misspelled_words,
+        &mut seen,
+        &mut completions,
+        max_results,
     );
 
     for fuzzy_match in dict.fuzzy_match(
@@ -2634,6 +2727,48 @@ mod completion_ranking_tests {
             more_frequent_plain < confident_correction,
             "frequency ({more_frequent_plain}) should outweigh the short-correction bonus ({confident_correction})"
         );
+    }
+
+    #[test]
+    fn apostrophe_less_contraction_surfaces_canonical_form() {
+        // Typed without the apostrophe (and these letters aren't words), the
+        // contraction is the clear intent and should lead with correct casing.
+        let dict = FstDictionary::curated();
+        for (typed, expected) in [
+            ("im", "I'm"),
+            ("ive", "I've"),
+            ("weve", "we've"),
+            ("dont", "don't"),
+        ] {
+            let words = ranked_words(typed, dict.as_ref(), &CompletionContext::default());
+            let head: Vec<&String> = words.iter().take(6).collect();
+            assert_eq!(
+                words.first().map(String::as_str),
+                Some(expected),
+                "typing {typed:?} should surface {expected:?} first, got {head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contraction_is_offered_but_keeps_a_common_typed_word_on_top() {
+        // When the typed letters are themselves a common word, the contraction is
+        // still offered but priced so the real word stays ahead.
+        let dict = FstDictionary::curated();
+        for (typed, contraction) in [("were", "we're"), ("id", "I'd")] {
+            let words = ranked_words(typed, dict.as_ref(), &CompletionContext::default());
+            let pos = |t: &str| words.iter().position(|w| w == t);
+            assert!(
+                words.iter().any(|w| w == contraction),
+                "{contraction:?} should be offered for {typed:?}"
+            );
+            if let (Some(real), Some(contr)) = (pos(typed), pos(contraction)) {
+                assert!(
+                    real < contr,
+                    "real word {typed:?} ({real}) should stay above {contraction:?} ({contr})"
+                );
+            }
+        }
     }
 
     #[test]
