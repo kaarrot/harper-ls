@@ -94,16 +94,14 @@ pub struct Backend {
 
 #[derive(Debug, Clone)]
 struct CompletionSortRank {
+    /// Primary ranking key: keyboard-edit cost blended with frequency and context
+    /// (lower is better). See [`combined_completion_cost`].
+    combined_cost: i32,
     distance: u16,
     exact_prefix: bool,
     typed_word: bool,
-    high_confidence_short_correction: bool,
     first_letter_match: bool,
     is_common: bool,
-    local_frequency: usize,
-    previous_word_frequency: usize,
-    global_bigram_rank: u32,
-    global_frequency_rank: u32,
     remaining_ambiguity: usize,
     replacement_len: usize,
 }
@@ -244,6 +242,116 @@ fn lowercase_chars(chars: &[char]) -> Vec<char> {
         .collect()
 }
 
+/// Weight on the log-frequency penalty. A candidate's frequency penalty is
+/// `FREQ_LOG_WEIGHT * ln(rank + 1)`, so the penalty grows slowly among common
+/// words (small gaps near the top of the list) but separates common words from
+/// rare ones — letting a much more frequent word reachable by a small keyboard
+/// edit outrank a rare exact match without flipping two similarly-common words.
+const FREQ_LOG_WEIGHT: f32 = 30.0;
+/// Penalty for words absent from the bundled 10k frequency list. Larger than the
+/// penalty of the least-frequent listed word (≈368), so any listed word is treated
+/// as more likely than an unlisted one, but small enough that a 2-3 edit gap can
+/// still overcome it.
+const UNKNOWN_FREQUENCY_PENALTY: i32 = 450;
+/// Cost shaved off the word the user actually typed. Keeps a *common* typed word
+/// on top of a slightly-more-common neighbor (so "do" isn't replaced by "to"),
+/// while still letting a far-more-common neighbor win when the typed word is rare
+/// (so "ruse" yields "rise").
+const TYPED_WORD_BONUS: i32 = 50;
+/// Per-occurrence cost shaved off a word already used in the document, capped so a
+/// heavily-repeated word can't override a large keyboard-distance gap.
+const LOCAL_USE_BONUS_PER_COUNT: i32 = 60;
+const MAX_LOCAL_USE_BONUS: i32 = 240;
+/// Per-occurrence cost shaved off a word seen following the previous word in the
+/// document (document-local bigram context), capped like the local-use bonus.
+const PREVIOUS_WORD_BONUS_PER_COUNT: i32 = 60;
+const MAX_PREVIOUS_WORD_BONUS: i32 = 240;
+/// Strongest cost shaved off a word that forms a known English collocation with
+/// the previous word (e.g. "new york"). Scaled down for rarer pairs.
+const GLOBAL_BIGRAM_BONUS_MAX: f32 = 200.0;
+const GLOBAL_BIGRAM_BONUS_MIN: i32 = 50;
+const GLOBAL_BIGRAM_LIST_LEN: f32 = 30_000.0;
+/// Extra cost for a correction that changes the first letter of what was typed.
+/// Phone users rarely fat-finger the first keystroke, so a same-first-letter
+/// substitution ("ruse"->"rise") is preferred over a first-letter-changing edit
+/// ("ruse"->"use") even when the latter is a more common word. Sized from real data
+/// to sit above ~97 (so "use", rank 60 and one deletion away, can't beat "rise" for
+/// "ruse") and below ~148 (so "and" still beats the first-letter-preserving "send"
+/// for "snd").
+const FIRST_LETTER_MISMATCH_PENALTY: i32 = 120;
+/// Bonus for a "high-confidence short correction": a short typed string (<=3 chars)
+/// one keyboard edit away from a same-length *common* word that isn't a prefix of
+/// what was typed (e.g. "teh"->"the", "adn"->"and"). This nudges a confident short
+/// fat-finger fix up the list, but is intentionally small so a clearly more frequent
+/// word still wins — it sits *below* frequency, not above it as the old tier did.
+/// Kept under the protections (<~76) so a common typed word isn't flipped to a
+/// same-length neighbor (e.g. "do" stays above "to").
+const HIGH_CONFIDENCE_SHORT_CORRECTION_BONUS: i32 = 40;
+
+/// Frequency penalty in keyboard-edit-cost units. `u32::MAX` marks an unlisted word.
+fn frequency_penalty(rank: u32) -> i32 {
+    if rank == u32::MAX {
+        UNKNOWN_FREQUENCY_PENALTY
+    } else {
+        (FREQ_LOG_WEIGHT * ((rank as f32) + 1.0).ln()).round() as i32
+    }
+}
+
+fn local_use_bonus(local_frequency: usize) -> i32 {
+    (local_frequency as i32)
+        .saturating_mul(LOCAL_USE_BONUS_PER_COUNT)
+        .min(MAX_LOCAL_USE_BONUS)
+}
+
+fn previous_word_bonus(previous_word_frequency: usize) -> i32 {
+    (previous_word_frequency as i32)
+        .saturating_mul(PREVIOUS_WORD_BONUS_PER_COUNT)
+        .min(MAX_PREVIOUS_WORD_BONUS)
+}
+
+fn global_bigram_bonus(global_bigram_rank: u32) -> i32 {
+    if global_bigram_rank == u32::MAX {
+        return 0;
+    }
+    let scaled =
+        GLOBAL_BIGRAM_BONUS_MAX * (1.0 - (global_bigram_rank as f32 / GLOBAL_BIGRAM_LIST_LEN));
+    (scaled.round() as i32).max(GLOBAL_BIGRAM_BONUS_MIN)
+}
+
+/// Blended primary ranking cost (lower is better): keyboard-edit distance plus a
+/// frequency penalty, minus bonuses for the typed word and document/collocation
+/// context. This is the Gboard-style trade-off of "how likely is this word"
+/// (frequency + context) against "how far is it from what was typed" (edit cost),
+/// so a common word a fat-finger away can beat a rare exact or prefix match.
+#[allow(clippy::too_many_arguments)]
+fn combined_completion_cost(
+    distance: u16,
+    typed_word: bool,
+    first_letter_match: bool,
+    high_confidence_short_correction: bool,
+    global_frequency_rank: u32,
+    local_frequency: usize,
+    previous_word_frequency: usize,
+    global_bigram_rank: u32,
+) -> i32 {
+    (distance as i32)
+        + frequency_penalty(global_frequency_rank)
+        + if first_letter_match {
+            0
+        } else {
+            FIRST_LETTER_MISMATCH_PENALTY
+        }
+        - if typed_word { TYPED_WORD_BONUS } else { 0 }
+        - if high_confidence_short_correction {
+            HIGH_CONFIDENCE_SHORT_CORRECTION_BONUS
+        } else {
+            0
+        }
+        - local_use_bonus(local_frequency)
+        - previous_word_bonus(previous_word_frequency)
+        - global_bigram_bonus(global_bigram_rank)
+}
+
 fn completion_sort_rank(
     query: &[char],
     candidate: &[char],
@@ -263,29 +371,43 @@ fn completion_sort_rank(
         .copied()
         .unwrap_or(0);
 
+    let typed_word = same_word_ignore_case(query, candidate);
+    let first_letter_match = first_letter_matches(query, candidate);
+    // A confident short fat-finger fix: <=3 typed chars, a same-length common word
+    // one edit away that isn't a prefix of what was typed (e.g. "teh"->"the").
+    let high_confidence_short_correction = query.len() <= 3
+        && candidate.len() == query.len()
+        && !prefix_score.exact_prefix
+        && prefix_score.distance <= INSERT_DELETE_COST
+        && is_common;
+    let local_frequency = context
+        .local_word_counts
+        .get(&normalized_candidate)
+        .copied()
+        .unwrap_or(0);
+    let global_bigram_rank = context
+        .previous_word
+        .as_ref()
+        .and_then(|previous_word| bigram_rank(previous_word, &normalized_candidate))
+        .unwrap_or(u32::MAX);
+    let global_frequency_rank = frequency_rank(&normalized_candidate).unwrap_or(u32::MAX);
+
     CompletionSortRank {
+        combined_cost: combined_completion_cost(
+            prefix_score.distance,
+            typed_word,
+            first_letter_match,
+            high_confidence_short_correction,
+            global_frequency_rank,
+            local_frequency,
+            previous_word_frequency,
+            global_bigram_rank,
+        ),
         distance: prefix_score.distance,
         exact_prefix: prefix_score.exact_prefix,
-        typed_word: same_word_ignore_case(query, candidate),
-        high_confidence_short_correction: query.len() <= 3
-            && candidate.len() == query.len()
-            && !prefix_score.exact_prefix
-            && prefix_score.distance <= INSERT_DELETE_COST
-            && is_common,
-        first_letter_match: first_letter_matches(query, candidate),
+        typed_word,
+        first_letter_match,
         is_common,
-        local_frequency: context
-            .local_word_counts
-            .get(&normalized_candidate)
-            .copied()
-            .unwrap_or(0),
-        previous_word_frequency,
-        global_bigram_rank: context
-            .previous_word
-            .as_ref()
-            .and_then(|previous_word| bigram_rank(previous_word, &normalized_candidate))
-            .unwrap_or(u32::MAX),
-        global_frequency_rank: frequency_rank(&normalized_candidate).unwrap_or(u32::MAX),
         remaining_ambiguity: candidate
             .len()
             .saturating_sub(prefix_score.matched_prefix_len),
@@ -294,26 +416,18 @@ fn completion_sort_rank(
 }
 
 fn compare_completion_ranks(a: &CompletionSortRank, b: &CompletionSortRank) -> Ordering {
-    b.typed_word
-        .cmp(&a.typed_word)
-        .then_with(|| {
-            b.high_confidence_short_correction
-                .cmp(&a.high_confidence_short_correction)
-        })
-        .then_with(|| a.distance.cmp(&b.distance))
+    // Primary key: the blended keyboard-edit-cost-plus-frequency score, which already
+    // folds in the typed-word bonus and document/collocation context. This is what
+    // lets a common word a fat-finger away (e.g. "rise" for "ruse", "response" for
+    // "respine") outrank a rare exact or prefix match. The remaining comparisons only
+    // break ties between candidates of equal blended cost.
+    a.combined_cost
+        .cmp(&b.combined_cost)
+        // Prefer a true prefix of what was typed over an equal-cost fuzzy correction.
         .then_with(|| b.exact_prefix.cmp(&a.exact_prefix))
         .then_with(|| b.first_letter_match.cmp(&a.first_letter_match))
         .then_with(|| b.is_common.cmp(&a.is_common))
-        .then_with(|| b.local_frequency.cmp(&a.local_frequency))
-        .then_with(|| b.previous_word_frequency.cmp(&a.previous_word_frequency))
-        // Global collocation strength (lower rank = more common pair). Sits below the
-        // document's own bigram context but above raw unigram frequency, so after
-        // "new" the prefix "yo" surfaces "york" ahead of the more frequent "you".
-        .then_with(|| a.global_bigram_rank.cmp(&b.global_bigram_rank))
-        // Global usage frequency (lower rank = more frequent). Sits below document
-        // context so personalization wins, but above length/alphabetical so common
-        // words like "work" beat rare same-length ones like "worm".
-        .then_with(|| a.global_frequency_rank.cmp(&b.global_frequency_rank))
+        // Prefer the shorter completion (less remaining ambiguity) at equal cost.
         .then_with(|| a.remaining_ambiguity.cmp(&b.remaining_ambiguity))
         .then_with(|| a.replacement_len.cmp(&b.replacement_len))
 }
@@ -2416,6 +2530,110 @@ mod completion_ranking_tests {
 
         assert!(words.iter().any(|word| word == "could"));
         assert!(words.iter().any(|word| word == "come"));
+    }
+
+    #[test]
+    fn common_neighbor_outranks_rare_typed_word() {
+        // "ruse" is a valid but rare word; "rise" is one near-key edit away (u <-> i)
+        // and far more common. Blended scoring surfaces the common neighbor first while
+        // keeping the typed word (and the "rues" transposition) lower in the list.
+        let dict = FstDictionary::curated();
+        let words = ranked_words("ruse", dict.as_ref(), &CompletionContext::default());
+        let top: Vec<&String> = words.iter().take(6).collect();
+        let pos = |t: &str| words.iter().position(|w| w == t);
+
+        assert_eq!(
+            words.first().map(String::as_str),
+            Some("rise"),
+            "expected 'rise' first, got {top:?}"
+        );
+        assert!(
+            pos("rise") < pos("ruse"),
+            "'rise' should outrank the rarer typed 'ruse': {top:?}"
+        );
+        assert!(
+            pos("rise") < pos("rues"),
+            "'rise' should outrank the transposition 'rues': {top:?}"
+        );
+        // The first-letter-mismatch penalty keeps the same-first-letter "rise" ahead
+        // of the more common but first-letter-changing "use" correction.
+        if let (Some(rise), Some(use_)) = (pos("rise"), pos("use")) {
+            assert!(
+                rise < use_,
+                "'rise' ({rise}) should outrank first-letter-changed 'use' ({use_}): {top:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_word_reachable_by_small_edit_is_listed_and_beats_rare_prefix() {
+        // "respine" -> the common "response" (sub i->o then insert s) must be listed
+        // and rank ahead of the rare exact-prefix continuation "respined", which the
+        // old distance-first comparator pinned on top.
+        let dict = FstDictionary::curated();
+        let words = ranked_words("respine", dict.as_ref(), &CompletionContext::default());
+        let head: Vec<&String> = words.iter().take(8).collect();
+        let pos = |t: &str| words.iter().position(|w| w == t);
+
+        assert!(
+            words.iter().any(|w| w == "response"),
+            "'response' should be listed for 'respine': {head:?}"
+        );
+        if let (Some(response), Some(respined)) = (pos("response"), pos("respined")) {
+            assert!(
+                response < respined,
+                "'response' ({response}) should outrank 'respined' ({respined}): {head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_prefix_surfaces_real_words_over_two_letter_noise() {
+        // Typing "im" should surface real words ("in", "image", "important") above
+        // two-letter fuzzy noise ("mi", "um", "km", "om"). The old high-confidence
+        // short-correction *tier* promoted this noise to the very top; demoting that
+        // signal to a small bonus (below frequency) keeps the real words on top.
+        let dict = FstDictionary::curated();
+        let words = ranked_words("im", dict.as_ref(), &CompletionContext::default());
+        let head: Vec<&String> = words.iter().take(8).collect();
+        let pos = |t: &str| words.iter().position(|w| w == t);
+
+        for noise in ["mi", "um", "km", "om"] {
+            if let (Some(real), Some(junk)) = (pos("in"), pos(noise)) {
+                assert!(
+                    real < junk,
+                    "real word 'in' ({real}) should rank above two-letter noise '{noise}' ({junk}): {head:?}"
+                );
+            }
+        }
+        if let (Some(image), Some(mi)) = (pos("image"), pos("mi")) {
+            assert!(
+                image < mi,
+                "prefix word 'image' ({image}) should rank above 'mi' ({mi}): {head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_confidence_short_correction_helps_but_stays_below_frequency() {
+        // Args: distance, typed_word, first_letter_match, high_confidence,
+        //       global_frequency_rank, local_frequency, previous_word_frequency,
+        //       global_bigram_rank.
+        // The bonus lowers the cost of a confident short correction...
+        let with = combined_completion_cost(82, false, true, true, 500, 0, 0, u32::MAX);
+        let without = combined_completion_cost(82, false, true, false, 500, 0, 0, u32::MAX);
+        assert_eq!(without - with, HIGH_CONFIDENCE_SHORT_CORRECTION_BONUS);
+
+        // ...but it sits *below* frequency: a much more common same-distance word
+        // (rank 50) still beats a high-confidence correction to a rare word (rank 5000).
+        let confident_correction =
+            combined_completion_cost(82, false, true, true, 5000, 0, 0, u32::MAX);
+        let more_frequent_plain =
+            combined_completion_cost(82, false, true, false, 50, 0, 0, u32::MAX);
+        assert!(
+            more_frequent_plain < confident_correction,
+            "frequency ({more_frequent_plain}) should outweigh the short-correction bonus ({confident_correction})"
+        );
     }
 
     #[test]
