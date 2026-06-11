@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::backend::CompletionStats;
 use crate::config::{CodeActionConfig, DiagnosticSeverity};
 use crate::diagnostics::{lint_to_code_actions, lints_to_diagnostics};
 use crate::pos_conv::{LineIndex, range_to_span};
@@ -22,6 +23,11 @@ pub struct DocumentState {
     pub line_index: LineIndex,
     pub last_diagnostics: Vec<Diagnostic>,
     pub misspelled_words: Arc<HashSet<String>>,
+    /// Shared snapshot of the document text, refreshed on every parse.
+    pub source: Arc<Vec<char>>,
+    /// Document-wide word/bigram counts for completion ranking, refreshed on
+    /// every parse so completion requests don't rescan the document.
+    pub completion_stats: Arc<CompletionStats>,
 }
 
 impl DocumentState {
@@ -114,6 +120,8 @@ impl Default for DocumentState {
             line_index: Default::default(),
             last_diagnostics: Vec::new(),
             misspelled_words: Arc::new(HashSet::new()),
+            source: Arc::new(Vec::new()),
+            completion_stats: Arc::new(CompletionStats::default()),
         }
     }
 }

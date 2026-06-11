@@ -119,11 +119,73 @@ struct RankedCompletion {
     rank: CompletionSortRank,
 }
 
+/// Document-wide word statistics for completion ranking, built once per parsed
+/// document revision (in `update_document`, riding the full reparse that already
+/// happens on every change) and shared with completion requests via `Arc`.
+/// Counts include every word token — the word currently being typed is removed
+/// at query time through [`CursorExclusions`].
+#[derive(Debug, Default)]
+pub(crate) struct CompletionStats {
+    word_counts: HashMap<String, usize>,
+    /// Bigram counts keyed by previous word, then following word.
+    bigram_counts: HashMap<String, HashMap<String, usize>>,
+}
+
+/// The cursor word's contribution to [`CompletionStats`], subtracted at query
+/// time so the half-typed word doesn't boost itself. Each entry is one excluded
+/// occurrence.
+#[derive(Debug, Clone, Default)]
+struct CursorExclusions {
+    words: Vec<String>,
+    pairs: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CompletionContext {
-    local_word_counts: HashMap<String, usize>,
-    previous_word_counts: HashMap<(String, String), usize>,
+    stats: Arc<CompletionStats>,
+    exclusions: CursorExclusions,
     previous_word: Option<String>,
+}
+
+impl CompletionContext {
+    /// How often `word` appears in the document, excluding the word being typed.
+    fn local_count(&self, word: &str) -> usize {
+        let total = self.stats.word_counts.get(word).copied().unwrap_or(0);
+        let excluded = self
+            .exclusions
+            .words
+            .iter()
+            .filter(|excluded| excluded.as_str() == word)
+            .count();
+        total.saturating_sub(excluded)
+    }
+
+    /// How often `word` follows `previous_word` in the document, excluding pairs
+    /// involving the word being typed.
+    fn pair_count(&self, previous_word: &str, word: &str) -> usize {
+        let total = self
+            .stats
+            .bigram_counts
+            .get(previous_word)
+            .and_then(|following| following.get(word))
+            .copied()
+            .unwrap_or(0);
+        let excluded = self
+            .exclusions
+            .pairs
+            .iter()
+            .filter(|(prev, next)| prev == previous_word && next == word)
+            .count();
+        total.saturating_sub(excluded)
+    }
+
+    /// How often `word` follows the word preceding the cursor.
+    fn previous_pair_count(&self, word: &str) -> usize {
+        self.previous_word
+            .as_deref()
+            .map(|previous_word| self.pair_count(previous_word, word))
+            .unwrap_or(0)
+    }
 }
 
 fn first_letter_matches(query: &[char], candidate: &[char]) -> bool {
@@ -368,16 +430,7 @@ fn completion_sort_rank(
     context: &CompletionContext,
 ) -> CompletionSortRank {
     let normalized_candidate = normalized_completion_word(candidate);
-    let previous_word_frequency = context
-        .previous_word
-        .as_ref()
-        .and_then(|previous_word| {
-            context
-                .previous_word_counts
-                .get(&(previous_word.clone(), normalized_candidate.clone()))
-        })
-        .copied()
-        .unwrap_or(0);
+    let previous_word_frequency = context.previous_pair_count(&normalized_candidate);
 
     let typed_word = same_word_ignore_case(query, candidate);
     let first_letter_match = first_letter_matches(query, candidate);
@@ -388,11 +441,7 @@ fn completion_sort_rank(
         && !prefix_score.exact_prefix
         && prefix_score.distance <= INSERT_DELETE_COST
         && is_common;
-    let local_frequency = context
-        .local_word_counts
-        .get(&normalized_candidate)
-        .copied()
-        .unwrap_or(0);
+    let local_frequency = context.local_count(&normalized_candidate);
     let global_bigram_rank = context
         .previous_word
         .as_ref()
@@ -440,14 +489,11 @@ fn compare_completion_ranks(a: &CompletionSortRank, b: &CompletionSortRank) -> O
         .then_with(|| a.replacement_len.cmp(&b.replacement_len))
 }
 
-fn build_completion_context(
-    source: &[char],
-    document: &Document,
-    current_word_start: usize,
-    current_word_end: usize,
-) -> CompletionContext {
-    let mut context = CompletionContext::default();
-    let mut previous_non_current_word: Option<String> = None;
+/// Builds the document-wide [`CompletionStats`] in one pass over the tokens.
+/// Runs in `update_document`, so completion requests never rescan the document.
+pub(crate) fn build_completion_stats(source: &[char], document: &Document) -> CompletionStats {
+    let mut stats = CompletionStats::default();
+    let mut previous_word: Option<String> = None;
 
     for token in document.tokens() {
         if !token.kind.is_word() {
@@ -455,33 +501,89 @@ fn build_completion_context(
         }
 
         let normalized_word = normalized_completion_word(token.span.get_content(source));
-        if token.span.end <= current_word_start {
-            context.previous_word = Some(normalized_word.clone());
-        }
-
-        let overlaps_current_word =
-            token.span.start < current_word_end && current_word_start < token.span.end;
-        if overlaps_current_word {
-            previous_non_current_word = None;
-            continue;
-        }
-
-        *context
-            .local_word_counts
+        *stats
+            .word_counts
             .entry(normalized_word.clone())
             .or_default() += 1;
 
-        if let Some(previous_word) = &previous_non_current_word {
-            *context
-                .previous_word_counts
-                .entry((previous_word.clone(), normalized_word.clone()))
+        if let Some(previous_word) = previous_word.take() {
+            *stats
+                .bigram_counts
+                .entry(previous_word)
+                .or_default()
+                .entry(normalized_word.clone())
                 .or_default() += 1;
         }
 
-        previous_non_current_word = Some(normalized_word);
+        previous_word = Some(normalized_word);
     }
 
-    context
+    stats
+}
+
+/// Computes the cursor word's contribution to the cached [`CompletionStats`]
+/// (to be subtracted at query time) along with the word preceding the cursor.
+/// Equivalent to excluding tokens overlapping `word_start..word_end` during a
+/// full document scan, but costs O(log n) instead of O(document).
+fn cursor_word_exclusions(
+    source: &[char],
+    document: &Document,
+    word_start: usize,
+    word_end: usize,
+) -> (CursorExclusions, Option<String>) {
+    let tokens = document.get_tokens();
+
+    // Tokens are ordered and non-overlapping, so `span.end` is monotonic: every
+    // token before this index ends at or before the cursor word.
+    let run_start = tokens.partition_point(|token| token.span.end <= word_start);
+
+    let previous_word = tokens[..run_start]
+        .iter()
+        .rev()
+        .find(|token| token.kind.is_word())
+        .map(|token| normalized_completion_word(token.span.get_content(source)));
+
+    // Word tokens overlapping the cursor word (more than one for e.g. a
+    // hyphenated word the tokenizer splits apart).
+    let mut overlapping = Vec::new();
+    let mut index = run_start;
+    while let Some(token) = tokens.get(index) {
+        if token.span.start >= word_end {
+            break;
+        }
+        if token.kind.is_word() {
+            overlapping.push(normalized_completion_word(token.span.get_content(source)));
+        }
+        index += 1;
+    }
+
+    // The full-document stats count the cursor word's occurrences and every
+    // bigram into, within, and out of its token run; the old per-request scan
+    // counted none of those, so they are exactly the exclusions.
+    let mut exclusions = CursorExclusions::default();
+    if let (Some(first), Some(last)) = (overlapping.first(), overlapping.last()) {
+        if let Some(previous_word) = &previous_word {
+            exclusions
+                .pairs
+                .push((previous_word.clone(), first.clone()));
+        }
+
+        let next_word = tokens[index..]
+            .iter()
+            .find(|token| token.kind.is_word())
+            .map(|token| normalized_completion_word(token.span.get_content(source)));
+        if let Some(next_word) = next_word {
+            exclusions.pairs.push((last.clone(), next_word));
+        }
+
+        for pair in overlapping.windows(2) {
+            exclusions.pairs.push((pair[0].clone(), pair[1].clone()));
+        }
+
+        exclusions.words = overlapping;
+    }
+
+    (exclusions, previous_word)
 }
 
 /// Checks whether `prefix` contains a space-adjacent key (v/b/n/m) that the
@@ -1436,9 +1538,17 @@ impl Backend {
                     doc_state.document = Document::default();
                 }
 
-                // Build line index for O(1) position conversions
-                let source: Vec<char> = doc_state.document.get_source().iter().copied().collect();
-                doc_state.line_index = crate::pos_conv::LineIndex::new(&source);
+                // Build the line index for O(1) position conversions, and refresh the
+                // shared source snapshot + completion stats so completion requests
+                // don't copy or rescan the document.
+                let source: Arc<Vec<char>> =
+                    Arc::new(doc_state.document.get_source().iter().copied().collect());
+                doc_state.line_index = crate::pos_conv::LineIndex::new(source.as_slice());
+                doc_state.completion_stats = Arc::new(build_completion_stats(
+                    source.as_slice(),
+                    &doc_state.document,
+                ));
+                doc_state.source = source;
             }
         }
 
@@ -1577,12 +1687,15 @@ impl Backend {
             let Some(doc_state) = doc_states.get(uri) else {
                 return Ok(Vec::new());
             };
-            let doc_source = doc_state.document.get_source();
-            let source: Vec<char> = doc_source.iter().copied().collect();
+            // Snapshot maintained by `update_document`; cloning the Arc avoids copying
+            // the document text on every request.
+            let source = doc_state.source.clone();
 
             // Convert LSP position to character index while holding the lock so we can
             // check the token kind before releasing it.
-            let cursor_index = doc_state.line_index.position_to_index(&source, position);
+            let cursor_index = doc_state
+                .line_index
+                .position_to_index(source.as_slice(), position);
 
             // Only complete inside lintable regions (comments/docstrings).
             // Code regions are marked Unlintable by the language parser — skip them.
@@ -1597,10 +1710,20 @@ impl Backend {
                 return Ok(Vec::new());
             }
 
-            let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+            let (word_start, word_end) =
+                find_completion_word_bounds(source.as_slice(), cursor_index);
             let prefix: Vec<char> = source[word_start..cursor_index].to_vec();
-            let context =
-                build_completion_context(&source, &doc_state.document, word_start, word_end);
+            let (exclusions, previous_word) = cursor_word_exclusions(
+                source.as_slice(),
+                &doc_state.document,
+                word_start,
+                word_end,
+            );
+            let context = CompletionContext {
+                stats: doc_state.completion_stats.clone(),
+                exclusions,
+                previous_word,
+            };
 
             (
                 source,
@@ -1640,8 +1763,8 @@ impl Backend {
                 .collect();
 
         // Calculate the start position of the word being completed
-        let word_start_position = line_index.index_to_position(&source, word_start);
-        let word_end_position = line_index.index_to_position(&source, word_end);
+        let word_start_position = line_index.index_to_position(source.as_slice(), word_start);
+        let word_end_position = line_index.index_to_position(source.as_slice(), word_end);
 
         // Convert prefix to string - we'll use this as filterText
         // This tells Helix that all our completions match the user's input
@@ -1693,8 +1816,8 @@ impl Backend {
         {
             let left_lower: String = lowercase_chars(&left_chars).iter().collect();
             let split_context = CompletionContext {
-                local_word_counts: context.local_word_counts.clone(),
-                previous_word_counts: context.previous_word_counts.clone(),
+                stats: context.stats.clone(),
+                exclusions: context.exclusions.clone(),
                 previous_word: Some(left_lower.clone()),
             };
             let right_completions = rank_completion_candidates(
@@ -2483,8 +2606,12 @@ mod completion_ranking_tests {
     #[test]
     fn local_frequency_boosts_repeated_document_words() {
         let dict = dict_with_words(&[("food", false), ("fool", false)]);
-        let mut context = CompletionContext::default();
-        context.local_word_counts.insert("food".to_string(), 3);
+        let mut stats = CompletionStats::default();
+        stats.word_counts.insert("food".to_string(), 3);
+        let context = CompletionContext {
+            stats: Arc::new(stats),
+            ..Default::default()
+        };
 
         let words = ranked_words("foo", &dict, &context);
 
@@ -2494,17 +2621,161 @@ mod completion_ranking_tests {
     #[test]
     fn previous_word_context_breaks_close_ties() {
         let dict = dict_with_words(&[("food", false), ("fool", false)]);
-        let mut context = CompletionContext {
+        let mut stats = CompletionStats::default();
+        stats
+            .bigram_counts
+            .entry("eat".to_string())
+            .or_default()
+            .insert("fool".to_string(), 2);
+        let context = CompletionContext {
+            stats: Arc::new(stats),
             previous_word: Some("eat".to_string()),
             ..Default::default()
         };
-        context
-            .previous_word_counts
-            .insert(("eat".to_string(), "fool".to_string()), 2);
 
         let words = ranked_words("foo", &dict, &context);
 
         assert_eq!(words[0], "fool");
+    }
+
+    /// The old per-request context scan, kept as the behavioral reference for
+    /// the cached-stats + cursor-exclusions path.
+    #[allow(clippy::type_complexity)]
+    fn reference_context(
+        source: &[char],
+        document: &Document,
+        current_word_start: usize,
+        current_word_end: usize,
+    ) -> (
+        HashMap<String, usize>,
+        HashMap<(String, String), usize>,
+        Option<String>,
+    ) {
+        let mut word_counts: HashMap<String, usize> = HashMap::new();
+        let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+        let mut previous_word = None;
+        let mut previous_non_current_word: Option<String> = None;
+
+        for token in document.tokens() {
+            if !token.kind.is_word() {
+                continue;
+            }
+
+            let normalized_word = normalized_completion_word(token.span.get_content(source));
+            if token.span.end <= current_word_start {
+                previous_word = Some(normalized_word.clone());
+            }
+
+            let overlaps_current_word =
+                token.span.start < current_word_end && current_word_start < token.span.end;
+            if overlaps_current_word {
+                previous_non_current_word = None;
+                continue;
+            }
+
+            *word_counts.entry(normalized_word.clone()).or_default() += 1;
+
+            if let Some(previous) = &previous_non_current_word {
+                *pair_counts
+                    .entry((previous.clone(), normalized_word.clone()))
+                    .or_default() += 1;
+            }
+
+            previous_non_current_word = Some(normalized_word);
+        }
+
+        (word_counts, pair_counts, previous_word)
+    }
+
+    /// Asserts the cached stats + exclusions produce the same effective counts
+    /// and previous word as a full rescan that skips the cursor word.
+    fn assert_cached_context_matches_rescan(text: &str, cursor_index: usize) {
+        let document = Document::new_plain_english_curated(text);
+        let source: Vec<char> = text.chars().collect();
+        let (word_start, word_end) = find_completion_word_bounds(&source, cursor_index);
+
+        let stats = Arc::new(build_completion_stats(&source, &document));
+        let (exclusions, previous_word) =
+            cursor_word_exclusions(&source, &document, word_start, word_end);
+        let context = CompletionContext {
+            stats,
+            exclusions,
+            previous_word,
+        };
+
+        let (reference_words, reference_pairs, reference_previous) =
+            reference_context(&source, &document, word_start, word_end);
+
+        assert_eq!(
+            context.previous_word, reference_previous,
+            "previous word for {text:?}"
+        );
+
+        // The reference counts are a subset of the full-document stats, so
+        // iterating the stats' support compares every count in either map.
+        for word in context.stats.word_counts.keys() {
+            assert_eq!(
+                context.local_count(word),
+                reference_words.get(word).copied().unwrap_or(0),
+                "unigram count for {word:?} in {text:?}"
+            );
+        }
+
+        for (previous, following) in &context.stats.bigram_counts {
+            for word in following.keys() {
+                assert_eq!(
+                    context.pair_count(previous, word),
+                    reference_pairs
+                        .get(&(previous.clone(), word.clone()))
+                        .copied()
+                        .unwrap_or(0),
+                    "pair count for ({previous:?}, {word:?}) in {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_stats_match_rescan_while_typing_at_document_end() {
+        let text = "the quick fox ate the food. The fox ate qui";
+        assert_cached_context_matches_rescan(text, text.chars().count());
+    }
+
+    #[test]
+    fn cached_stats_match_rescan_with_cursor_mid_document() {
+        let text = "alpha beta gamma delta beta gamma";
+        // Cursor inside the first "gamma".
+        assert_cached_context_matches_rescan(text, "alpha beta gam".chars().count());
+    }
+
+    #[test]
+    fn cached_stats_match_rescan_for_multi_token_cursor_word() {
+        // The completion word bounds treat "re-entering" as one word, but the
+        // tokenizer may split it into several word tokens — the exclusion logic
+        // must remove the whole run and its boundary bigrams.
+        let text = "we keep re-entering the zone before re-entering";
+        assert_cached_context_matches_rescan(text, text.chars().count());
+    }
+
+    #[test]
+    fn cursor_word_does_not_boost_itself() {
+        let text = "food is good food foo";
+        let document = Document::new_plain_english_curated(text);
+        let source: Vec<char> = text.chars().collect();
+        let (word_start, word_end) = find_completion_word_bounds(&source, source.len());
+
+        let stats = Arc::new(build_completion_stats(&source, &document));
+        let (exclusions, previous_word) =
+            cursor_word_exclusions(&source, &document, word_start, word_end);
+        let context = CompletionContext {
+            stats,
+            exclusions,
+            previous_word,
+        };
+
+        assert_eq!(context.local_count("foo"), 0);
+        assert_eq!(context.local_count("food"), 2);
+        assert_eq!(context.previous_word.as_deref(), Some("food"));
     }
 
     #[test]
