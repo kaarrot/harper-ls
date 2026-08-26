@@ -81,15 +81,16 @@ const MAX_NOISY_PREFIX_EXPANSION_CANDIDATES: usize = 128;
 /// these instead of space fuses two words into one token (e.g. "thenworld").
 const SPACE_ADJACENT_KEYS: &[char] = &['v', 'b', 'n', 'm'];
 
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
-    root: RwLock<PathBuf>,
-    config: RwLock<Config>,
-    stats: RwLock<Stats>,
-    doc_state: Mutex<HashMap<Uri, DocumentState>>,
-    pending_changes: RwLock<HashMap<Uri, Instant>>,
-    dict_cache: RwLock<HashMap<Uri, DictCacheEntry>>,
-    in_flight_changes: RwLock<HashMap<Uri, InFlightChange>>,
+    root: Arc<RwLock<PathBuf>>,
+    config: Arc<RwLock<Config>>,
+    stats: Arc<RwLock<Stats>>,
+    doc_state: Arc<Mutex<HashMap<Uri, DocumentState>>>,
+    pending_changes: Arc<RwLock<HashMap<Uri, Instant>>>,
+    dict_cache: Arc<RwLock<HashMap<Uri, DictCacheEntry>>>,
+    in_flight_changes: Arc<RwLock<HashMap<Uri, InFlightChange>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1116,17 +1117,89 @@ fn find_completion_word_bounds(source: &[char], cursor_index: usize) -> (usize, 
     (word_start, word_end)
 }
 
+/// Token at the completion cursor.
+///
+/// LSP positions sit at the *exclusive* end of the token being typed. Harper
+/// spans are also exclusive, so `get_token_at_char_index(cursor)` returns
+/// `None` at EOF and at the end of a word. Fall back to the character
+/// immediately before the cursor in that case.
+fn token_at_completion_cursor(
+    document: &Document,
+    cursor_index: usize,
+) -> Option<&harper_core::Token> {
+    document.get_token_at_char_index(cursor_index).or_else(|| {
+        cursor_index
+            .checked_sub(1)
+            .and_then(|index| document.get_token_at_char_index(index))
+    })
+}
+
+fn is_cursor_in_lintable_region(document: &Document, cursor_index: usize) -> bool {
+    token_at_completion_cursor(document, cursor_index)
+        .is_some_and(|token| !matches!(token.kind, TokenKind::Unlintable))
+}
+
+struct SplitRankedItem {
+    left_chars: Vec<char>,
+    right_prefix: Vec<char>,
+    right_word: String,
+}
+
+fn rank_completions_and_splits(
+    dict: &dyn Dictionary,
+    prefix: &[char],
+    context: &CompletionContext,
+    misspelled_words: &HashSet<String>,
+    max_results: usize,
+    split_min_right: usize,
+) -> (Vec<RankedCompletion>, Vec<SplitRankedItem>) {
+    let ranking_limit = max_results.max(2);
+    let completions =
+        rank_completion_candidates(dict, prefix, context, misspelled_words, ranking_limit);
+
+    let mut splits = Vec::new();
+    'splits: for (left_chars, right_prefix) in
+        find_missed_space_splits(prefix, dict, split_min_right)
+    {
+        let left_lower: String = lowercase_chars(&left_chars).iter().collect();
+        let split_context = CompletionContext {
+            stats: context.stats.clone(),
+            exclusions: context.exclusions.clone(),
+            previous_word: Some(left_lower),
+        };
+        let right_completions = rank_completion_candidates(
+            dict,
+            &right_prefix,
+            &split_context,
+            misspelled_words,
+            ranking_limit,
+        );
+        for ranked in right_completions.into_iter().take(max_results) {
+            if completions.len() + splits.len() >= 2 * max_results {
+                break 'splits;
+            }
+            splits.push(SplitRankedItem {
+                left_chars: left_chars.clone(),
+                right_prefix: right_prefix.clone(),
+                right_word: ranked.word,
+            });
+        }
+    }
+
+    (completions, splits)
+}
+
 impl Backend {
     pub fn new(client: Client, config: Config) -> Self {
         Self {
             client,
-            root: RwLock::new(".".into()),
-            stats: RwLock::new(Stats::new()),
-            config: RwLock::new(config),
-            doc_state: Mutex::new(HashMap::new()),
-            pending_changes: RwLock::new(HashMap::new()),
-            dict_cache: RwLock::new(HashMap::new()),
-            in_flight_changes: RwLock::new(HashMap::new()),
+            root: Arc::new(RwLock::new(".".into())),
+            stats: Arc::new(RwLock::new(Stats::new())),
+            config: Arc::new(RwLock::new(config)),
+            doc_state: Arc::new(Mutex::new(HashMap::new())),
+            pending_changes: Arc::new(RwLock::new(HashMap::new())),
+            dict_cache: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_changes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1665,6 +1738,44 @@ impl Backend {
         }
     }
 
+    async fn run_debounced_diagnostics(&self, uri: Uri, now: Instant) {
+        sleep(Duration::from_millis(MISSPELLED_REFRESH_DEBOUNCE_MS)).await;
+
+        let should_refresh_misspellings = {
+            let pending = self.pending_changes.read().await;
+            pending.get(&uri).is_some_and(|&timestamp| timestamp == now)
+        };
+
+        if should_refresh_misspellings {
+            self.refresh_misspelled_words_cache(&uri).await;
+        } else {
+            // A newer change came in, skip this refresh cycle.
+            return;
+        }
+
+        let publish_wait_ms =
+            DIAGNOSTICS_PUBLISH_DEBOUNCE_MS.saturating_sub(MISSPELLED_REFRESH_DEBOUNCE_MS);
+        if publish_wait_ms > 0 {
+            sleep(Duration::from_millis(publish_wait_ms)).await;
+        }
+
+        let should_process = {
+            let pending = self.pending_changes.read().await;
+            pending.get(&uri).is_some_and(|&timestamp| timestamp == now)
+        };
+
+        if !should_process {
+            return;
+        }
+
+        self.publish_diagnostics(&uri).await;
+
+        let mut pending = self.pending_changes.write().await;
+        if pending.get(&uri).is_some_and(|&timestamp| timestamp == now) {
+            pending.remove(&uri);
+        }
+    }
+
     /// Generate completion suggestions based on the current cursor position
     async fn generate_completions(
         &self,
@@ -1697,16 +1808,11 @@ impl Backend {
                 .line_index
                 .position_to_index(source.as_slice(), position);
 
-            // Only complete inside lintable regions (comments/docstrings).
-            // Code regions are marked Unlintable by the language parser — skip them.
-            // If no token exists at the cursor (e.g. empty file), also skip.
-            let token_check_index = cursor_index.min(source.len().saturating_sub(1));
-            let in_lintable_region = !source.is_empty()
-                && doc_state
-                    .document
-                    .get_token_at_char_index(token_check_index)
-                    .is_some_and(|t| !matches!(t.kind, TokenKind::Unlintable));
-            if !in_lintable_region {
+            // Only complete inside lintable regions (comments/docstrings/prose).
+            // Code is Unlintable. Cursor usually sits at the exclusive end of the
+            // word being typed (EOF on the last line), so look at the previous
+            // character when there is no token *at* the cursor.
+            if !is_cursor_in_lintable_region(&doc_state.document, cursor_index) {
                 return Ok(Vec::new());
             }
 
@@ -1746,36 +1852,46 @@ impl Backend {
             return Ok(Vec::new());
         }
 
-        // Perform completion-specific prefix scoring without holding the document lock.
-        let ranking_limit = completion_config.max_results.max(2);
-        let completions = rank_completion_candidates(
-            dict.as_ref(),
-            &prefix,
-            &context,
-            misspelled_words.as_ref(),
-            ranking_limit,
-        );
-        let space_commit_flags: Vec<bool> =
-            (0..completion_config.max_results.min(completions.len()))
-                .map(|idx| {
-                    should_item_commit_space(idx, &completions, completion_config.commit_with_space)
-                })
-                .collect();
+        // Rank off the async worker so fuzzy matching cannot stall didChange.
+        let split_min_right = completion_config.min_prefix_length.max(2);
+        let max_results = completion_config.max_results;
+        let commit_with_space = completion_config.commit_with_space;
+        let ranking_dict = dict.clone();
+        let ranking_prefix = prefix.clone();
+        let ranking_context = context.clone();
+        let ranking_misspelled = misspelled_words.clone();
+        let (completions, splits) = tokio::task::spawn_blocking(move || {
+            rank_completions_and_splits(
+                ranking_dict.as_ref(),
+                &ranking_prefix,
+                &ranking_context,
+                ranking_misspelled.as_ref(),
+                max_results,
+                split_min_right,
+            )
+        })
+        .await
+        .map_err(|err| {
+            error!("completion ranking task failed: {err}");
+            tower_lsp_server::jsonrpc::Error::internal_error()
+        })?;
+
+        let space_commit_flags: Vec<bool> = (0..max_results.min(completions.len()))
+            .map(|idx| should_item_commit_space(idx, &completions, commit_with_space))
+            .collect();
 
         // Calculate the start position of the word being completed
         let word_start_position = line_index.index_to_position(source.as_slice(), word_start);
         let word_end_position = line_index.index_to_position(source.as_slice(), word_end);
 
-        // Convert prefix to string - we'll use this as filterText
-        // This tells Helix that all our completions match the user's input
-        let prefix_string: String = prefix.iter().collect();
-
         // Convert to LSP completion items
         // Use text_edit to specify exact replacement range - this tells Helix what to replace
-        // Set filter_text to prefix so items aren't filtered out while typing
+        // filter_text is the candidate (not the typed prefix). Helix fuzzy-matches the
+        // growing insert-mode filter against filter_text; using the prefix made every
+        // item vanish as soon as the user typed one more character.
         let completion_items: Vec<CompletionItem> = completions
             .into_iter()
-            .take(completion_config.max_results)
+            .take(max_results)
             .enumerate()
             .map(|(idx, completion)| {
                 // Apply the casing from the user's prefix to the completion
@@ -1794,8 +1910,7 @@ impl Backend {
                         },
                         new_text: completion_text,
                     })),
-                    // filter_text must match what user typed for Helix to show the item
-                    filter_text: Some(prefix_string.clone()),
+                    filter_text: Some(word_string),
                     sort_text: Some(format!("{:05}", idx)),
                     commit_characters: space_commit_flags[idx].then(|| vec![" ".to_string()]),
                     ..Default::default()
@@ -1807,39 +1922,22 @@ impl Backend {
         // two words into one token (e.g. "thenworld" → offer "the world").
         // These are appended after normal completions so they don't displace exact
         // single-word completions, but they surface as an option the user can pick.
-        let split_min_right = completion_config.min_prefix_length.max(2);
         let normal_count = completion_items.len();
-        let mut split_items: Vec<CompletionItem> = Vec::new();
-
-        'splits: for (left_chars, right_prefix) in
-            find_missed_space_splits(&prefix, dict.as_ref(), split_min_right)
-        {
-            let left_lower: String = lowercase_chars(&left_chars).iter().collect();
-            let split_context = CompletionContext {
-                stats: context.stats.clone(),
-                exclusions: context.exclusions.clone(),
-                previous_word: Some(left_lower.clone()),
-            };
-            let right_completions = rank_completion_candidates(
-                dict.as_ref(),
-                &right_prefix,
-                &split_context,
-                misspelled_words.as_ref(),
-                ranking_limit,
-            );
-            let left_display = apply_prefix_casing(&prefix[..left_chars.len()], &left_lower);
-            for rc in right_completions
-                .into_iter()
-                .take(completion_config.max_results)
-            {
-                if normal_count + split_items.len() >= 2 * completion_config.max_results {
-                    break 'splits;
-                }
-                let right_display = apply_prefix_casing(&right_prefix, &rc.word);
+        let split_items: Vec<CompletionItem> = splits
+            .into_iter()
+            .enumerate()
+            .map(|(split_idx, split)| {
+                let left_lower: String = lowercase_chars(&split.left_chars).iter().collect();
+                let left_display =
+                    apply_prefix_casing(&prefix[..split.left_chars.len()], &left_lower);
+                let right_display = apply_prefix_casing(&split.right_prefix, &split.right_word);
                 let combined_text = format!("{left_display} {right_display}");
-                let combined_label = format!("{left_lower} {}", rc.word);
-                let sort_idx = normal_count + split_items.len();
-                split_items.push(CompletionItem {
+                let combined_label = format!("{left_lower} {}", split.right_word);
+                // Concatenate without space so Helix's filter ("thenworld") still
+                // matches the two-word candidate ("theworld").
+                let filter_text = format!("{left_lower}{}", split.right_word);
+                let sort_idx = normal_count + split_idx;
+                CompletionItem {
                     label: combined_label,
                     kind: Some(CompletionItemKind::TEXT),
                     detail: Some("Harper".to_string()),
@@ -1850,12 +1948,12 @@ impl Backend {
                         },
                         new_text: combined_text,
                     })),
-                    filter_text: Some(prefix_string.clone()),
+                    filter_text: Some(filter_text),
                     sort_text: Some(format!("{:05}", sort_idx)),
                     ..Default::default()
-                });
-            }
-        }
+                }
+            })
+            .collect();
 
         let mut all_items = completion_items;
         all_items.extend(split_items);
@@ -2066,55 +2164,19 @@ impl LanguageServer for Backend {
             params.text_document.version, change_elapsed
         );
 
-        // Record this change with current timestamp for debounced diagnostics
+        // Record this change with current timestamp for debounced diagnostics.
+        // Sleep/lint off the notification handler so completions are not queued
+        // behind 300ms of debounce per keystroke.
         let now = Instant::now();
         {
             let mut pending = self.pending_changes.write().await;
             pending.insert(uri.clone(), now);
         }
 
-        // Refresh misspelled-word filtering sooner than full diagnostics publish.
-        sleep(Duration::from_millis(MISSPELLED_REFRESH_DEBOUNCE_MS)).await;
-
-        let should_refresh_misspellings = {
-            let pending = self.pending_changes.read().await;
-            pending.get(&uri).is_some_and(|&timestamp| timestamp == now)
-        };
-
-        if should_refresh_misspellings {
-            self.refresh_misspelled_words_cache(&uri).await;
-        } else {
-            // A newer change came in, skip this refresh cycle.
-            return;
-        }
-
-        let publish_wait_ms =
-            DIAGNOSTICS_PUBLISH_DEBOUNCE_MS.saturating_sub(MISSPELLED_REFRESH_DEBOUNCE_MS);
-        if publish_wait_ms > 0 {
-            sleep(Duration::from_millis(publish_wait_ms)).await;
-        }
-
-        // Check if this is still the latest change for this URI
-        let should_process = {
-            let pending = self.pending_changes.read().await;
-            pending
-                .get(&uri)
-                .map_or(false, |&timestamp| timestamp == now)
-        };
-
-        if !should_process {
-            // A newer change came in, skip publishing diagnostics
-            return;
-        }
-
-        // Publish diagnostics (debounced)
-        self.publish_diagnostics(&uri).await;
-
-        // Clear from pending
-        {
-            let mut pending = self.pending_changes.write().await;
-            pending.remove(&uri);
-        }
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend.run_debounced_diagnostics(uri, now).await;
+        });
     }
 
     async fn did_close(&self, _params: DidCloseTextDocumentParams) {
@@ -2376,15 +2438,14 @@ impl LanguageServer for Backend {
             )
             .await?;
 
-        if completions.is_empty() {
-            Ok(None)
-        } else {
-            use tower_lsp_server::lsp_types::CompletionList;
-            Ok(Some(CompletionResponse::List(CompletionList {
-                is_incomplete: true,
-                items: completions,
-            })))
-        }
+        // Always an incomplete list. Helix maps `None` / a complete empty list
+        // to "stop asking", which kills the popup after a single miss (EOF,
+        // unlintable, short prefix).
+        use tower_lsp_server::lsp_types::CompletionList;
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items: completions,
+        })))
     }
 
     async fn shutdown(&self) -> JsonResult<()> {
@@ -2472,6 +2533,40 @@ mod completion_ranking_tests {
 
         assert_eq!(word_start, 5);
         assert_eq!(word_end, 16);
+    }
+
+    #[test]
+    fn cursor_at_eof_after_last_word_is_lintable() {
+        let document = Document::new_plain_english_curated("hello world");
+        let eof = "hello world".chars().count();
+
+        assert!(is_cursor_in_lintable_region(&document, eof));
+        // Exclusive end of "world" is also EOF here.
+        assert!(token_at_completion_cursor(&document, eof).is_some());
+    }
+
+    #[test]
+    fn cursor_at_exclusive_end_of_word_before_newline_is_lintable() {
+        let document = Document::new_plain_english_curated("hello\n");
+        let word_end = "hello".chars().count();
+
+        assert!(is_cursor_in_lintable_region(&document, word_end));
+    }
+
+    #[test]
+    fn empty_document_is_not_lintable() {
+        let document = Document::new_plain_english_curated("");
+
+        assert!(!is_cursor_in_lintable_region(&document, 0));
+        assert!(token_at_completion_cursor(&document, 0).is_none());
+    }
+
+    #[test]
+    fn unlintable_markdown_code_span_is_skipped() {
+        let document = Document::new_markdown_default_curated("see `abc` now");
+        let inside_code = "see `ab".chars().count();
+
+        assert!(!is_cursor_in_lintable_region(&document, inside_code));
     }
 
     #[test]
