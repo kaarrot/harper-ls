@@ -1012,6 +1012,37 @@ fn should_item_commit_space(
     }
 }
 
+/// Builds the `filterText` for a completion item: the typed prefix followed by the
+/// candidate.
+///
+/// Clients filter items themselves, and they do it by fuzzy-matching what the user
+/// has typed against `filterText`, dropping any item that isn't a subsequence match.
+/// Helix deletes non-matching items outright (`ui/completion.rs`, nucleo `Atom`
+/// scoring: `None` => removed) and closes the popup when nothing survives.
+///
+/// Neither obvious choice works alone:
+/// - The bare candidate loses exactly the corrections that matter here. A typo is not
+///   a subsequence of its fix, so "tge"/"the", "snd"/"and" and every transposition
+///   ("teh"/"the") score `None` and never reach the screen, however well they rank.
+/// - The bare typed prefix goes stale on the next keystroke: filter "worl" against a
+///   `filterText` of "wor" also scores `None`, so the popup empties as the user types.
+///
+/// Prepending the prefix satisfies both: the current filter matches as a literal
+/// prefix, and the candidate's own letters keep it matching as the word grows
+/// ("tgethe" still matches "tget", then "tgeth").
+///
+/// It also hands ranking back to us. Since every item shares the typed prefix, they
+/// all score identically (nucleo gives all candidates 96 for a 3-char filter, 122 for
+/// 4, ...), and Helix's sort — `(score <= min_score, preselect, provider_priority,
+/// Reverse(score), index)` — falls through to the index, which follows `sortText`.
+/// The blended ranking in `compare_completion_ranks` therefore survives to the UI
+/// instead of being reshuffled by the client's fuzzy matcher.
+fn completion_filter_text(prefix: &[char], candidate: &str) -> String {
+    let mut filter_text: String = prefix.iter().collect();
+    filter_text.push_str(candidate);
+    filter_text
+}
+
 /// Apply casing intent from the typed prefix to a completion candidate.
 ///
 /// Behavior:
@@ -1886,9 +1917,8 @@ impl Backend {
 
         // Convert to LSP completion items
         // Use text_edit to specify exact replacement range - this tells Helix what to replace
-        // filter_text is the candidate (not the typed prefix). Helix fuzzy-matches the
-        // growing insert-mode filter against filter_text; using the prefix made every
-        // item vanish as soon as the user typed one more character.
+        // filter_text is the typed prefix followed by the candidate; see
+        // `completion_filter_text` for why neither half works on its own.
         let completion_items: Vec<CompletionItem> = completions
             .into_iter()
             .take(max_results)
@@ -1910,7 +1940,7 @@ impl Backend {
                         },
                         new_text: completion_text,
                     })),
-                    filter_text: Some(word_string),
+                    filter_text: Some(completion_filter_text(&prefix, &word_string)),
                     sort_text: Some(format!("{:05}", idx)),
                     commit_characters: space_commit_flags[idx].then(|| vec![" ".to_string()]),
                     ..Default::default()
@@ -1933,9 +1963,12 @@ impl Backend {
                 let right_display = apply_prefix_casing(&split.right_prefix, &split.right_word);
                 let combined_text = format!("{left_display} {right_display}");
                 let combined_label = format!("{left_lower} {}", split.right_word);
-                // Concatenate without space so Helix's filter ("thenworld") still
-                // matches the two-word candidate ("theworld").
-                let filter_text = format!("{left_lower}{}", split.right_word);
+                // The split candidate is joined without a space, then prefixed with
+                // what was typed: the fused token ("thenworld") is not a subsequence
+                // of the split ("theworld"), so without the prefix the client's
+                // fuzzy filter drops the item.
+                let filter_text =
+                    completion_filter_text(&prefix, &format!("{left_lower}{}", split.right_word));
                 let sort_idx = normal_count + split_idx;
                 CompletionItem {
                     label: combined_label,
@@ -2936,33 +2969,35 @@ mod completion_ranking_tests {
         assert_eq!(no_context[0], "you");
     }
 
+    /// Characterization corpus for adjacent-key "fat-finger" typos: one key replaced
+    /// by a physical neighbor on the phone QWERTY layout. Pins current behavior so a
+    /// future keyboard cost-model tweak (keyboard_distance.rs) can't silently regress
+    /// it, and so the emitted `filterText` keeps these corrections visible client-side.
+    const FAT_FINGER_TYPO_CORPUS: &[(&str, &str)] = &[
+        ("tge", "the"),         // g <-> h
+        ("wprk", "work"),       // o <-> p
+        ("wirk", "work"),       // i <-> o
+        ("abiut", "about"),     // o <-> i
+        ("tjis", "this"),       // h <-> j
+        ("wuth", "with"),       // i <-> u
+        ("fimd", "find"),       // n <-> m
+        ("yhe", "the"),         // t <-> y
+        ("soace", "space"),     // o <-> p
+        ("befpre", "before"),   // o <-> p
+        ("vould", "could"),     // c <-> v
+        ("shoukd", "should"),   // l <-> k
+        ("wjat", "what"),       // h <-> j
+        ("snd", "and"),         // a <-> s
+        ("becauae", "because"), // s <-> a
+    ];
+
     #[test]
     fn fat_finger_adjacent_key_typos_rank_intended_word_first() {
-        // Characterization corpus for adjacent-key "fat-finger" typos: one key replaced
-        // by a physical neighbor on the phone QWERTY layout. Pins current behavior so a
-        // future keyboard cost-model tweak (keyboard_distance.rs) can't silently regress
-        // it. Each typo should make its intended word the top suggestion.
+        // Each typo should make its intended word the top suggestion.
         let dict = FstDictionary::curated();
-        let cases = [
-            ("tge", "the"),         // g <-> h
-            ("wprk", "work"),       // o <-> p
-            ("wirk", "work"),       // i <-> o
-            ("abiut", "about"),     // o <-> i
-            ("tjis", "this"),       // h <-> j
-            ("wuth", "with"),       // i <-> u
-            ("fimd", "find"),       // n <-> m
-            ("yhe", "the"),         // t <-> y
-            ("soace", "space"),     // o <-> p
-            ("befpre", "before"),   // o <-> p
-            ("vould", "could"),     // c <-> v
-            ("shoukd", "should"),   // l <-> k
-            ("wjat", "what"),       // h <-> j
-            ("snd", "and"),         // a <-> s
-            ("becauae", "because"), // s <-> a
-        ];
 
         let mut failures = Vec::new();
-        for (typo, expected) in cases {
+        for &(typo, expected) in FAT_FINGER_TYPO_CORPUS {
             let words = ranked_words(typo, dict.as_ref(), &CompletionContext::default());
             if words.first().map(String::as_str) != Some(expected) {
                 let top5: Vec<&String> = words.iter().take(5).collect();
@@ -2977,6 +3012,93 @@ mod completion_ranking_tests {
             "adjacent-key typos not ranked #1:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// Mirrors the rule an LSP client's fuzzy filter applies to `filterText`. Helix
+    /// scores the typed filter against it with nucleo (`AtomKind::Fuzzy`,
+    /// `CaseMatching::Ignore`); an item that is not a case-insensitive subsequence
+    /// match scores `None` and is deleted from the menu, and an emptied menu closes
+    /// the popup outright.
+    fn client_fuzzy_matches(filter: &str, filter_text: &str) -> bool {
+        let mut haystack = filter_text.chars().flat_map(char::to_lowercase);
+        filter
+            .chars()
+            .flat_map(char::to_lowercase)
+            .all(|needle| haystack.any(|candidate| candidate == needle))
+    }
+
+    #[test]
+    fn fat_finger_filter_text_survives_client_side_filtering() {
+        // Ranking a correction first is not enough: the item still has to get past the
+        // client's own filter. A substituted key is absent from the intended word, so
+        // the bare candidate is never a subsequence match and the correction is dropped
+        // before it is drawn. Prefixing what was typed is what keeps it on screen.
+        let dict = FstDictionary::curated();
+
+        let mut failures = Vec::new();
+        for &(typo, expected) in FAT_FINGER_TYPO_CORPUS {
+            let words = ranked_words(typo, dict.as_ref(), &CompletionContext::default());
+            let Some(top) = words.first() else {
+                failures.push(format!("{typo:?} -> no completions at all"));
+                continue;
+            };
+
+            if client_fuzzy_matches(typo, expected) {
+                failures.push(format!(
+                    "{typo:?} -> {expected:?} matches on its own; the negative control \
+                     for this corpus entry no longer holds"
+                ));
+            }
+
+            let filter_text = completion_filter_text(&chars(typo), top);
+            if !client_fuzzy_matches(typo, &filter_text) {
+                failures.push(format!(
+                    "{typo:?} -> filter_text {filter_text:?} would be filtered out client-side"
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "fat-finger corrections would not survive client-side filtering:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn filter_text_survives_the_next_keystroke() {
+        // Clients re-score the items they already hold against the grown filter before
+        // the next response arrives. A bare typed prefix goes stale at once — the bug
+        // that emptied the popup on every keystroke — while the candidate's own letters
+        // carry the prefixed form through the following keystrokes.
+        assert!(!client_fuzzy_matches("worl", "wor"));
+
+        let world = completion_filter_text(&chars("wor"), "world");
+        assert_eq!(world, "worworld");
+        assert!(client_fuzzy_matches("wor", &world));
+        assert!(client_fuzzy_matches("worl", &world));
+        assert!(client_fuzzy_matches("world", &world));
+
+        let the = completion_filter_text(&chars("tge"), "the");
+        assert_eq!(the, "tgethe");
+        assert!(client_fuzzy_matches("tge", &the));
+        assert!(client_fuzzy_matches("tget", &the));
+        assert!(client_fuzzy_matches("tgeth", &the));
+
+        // Casing is the user's, and the client matches case-insensitively.
+        let capitalized = completion_filter_text(&chars("Tge"), "the");
+        assert_eq!(capitalized, "Tgethe");
+        assert!(client_fuzzy_matches("Tge", &capitalized));
+    }
+
+    #[test]
+    fn missed_space_split_filter_text_survives_client_side_filtering() {
+        // The fused token carries the mis-hit key ("n" in "thenworld"), which the split
+        // candidate does not, so joining the two words is not enough on its own.
+        assert!(!client_fuzzy_matches("thenworld", "theworld"));
+
+        let filter_text = completion_filter_text(&chars("thenworld"), "theworld");
+        assert!(client_fuzzy_matches("thenworld", &filter_text));
     }
 
     #[test]
